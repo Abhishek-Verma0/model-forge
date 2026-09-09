@@ -1,0 +1,11 @@
+pandas
+openpyxl
+requests
+fastapi
+uvicorn[standard]
+python-multipart
+
+matplotlib
+seaborn
+scikit-learn
+imbalanced-learn
