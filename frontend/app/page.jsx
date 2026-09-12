@@ -9,6 +9,9 @@ import ChartBuilder from "./builder";
 import Clean from "./clean";
 import Preprocess from "./preprocess";
 import ChatPanel from "./chat";
+import Landing from "./landing";
+import DatasetUpload from "./upload";
+import DatasetPreview from "./preview";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const MAX_MB = 200;
@@ -38,12 +41,15 @@ const num = (v) =>
   typeof v === "number" ? v.toLocaleString(undefined, { maximumFractionDigits: 3 }) : v ?? "—";
 
 export default function Page() {
+  const [viewMode, setViewMode] = useState("landing");
+  const [activeTab, setActiveTab] = useState("upload");
   const [file, setFile] = useState(null);
-  const [over, setOver] = useState(false);
+  const [datasetName, setDatasetName] = useState("");
+  const [taskType, setTaskType] = useState("auto");
+  const [target, setTarget] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
-  const inputRef = useRef(null);
 
   function pick(f) {
     setError("");
@@ -58,14 +64,16 @@ export default function Page() {
       return;
     }
     setFile(f);
-    setResult(null);
+    if (!datasetName) {
+      const base = f.name.replace(/\.[^/.]+$/, "");
+      setDatasetName(base.replace(/[-_]/g, " "));
+    }
   }
 
   async function analyze() {
     if (!file) return;
     setLoading(true);
     setError("");
-    setResult(null);
     try {
       const form = new FormData();
       form.append("file", file);
@@ -78,7 +86,9 @@ export default function Page() {
         } catch {}
         throw new Error(detail);
       }
-      setResult(await res.json());
+      const data = await res.json();
+      setResult(data);
+      setActiveTab("preview");
     } catch (e) {
       setError(
         e instanceof TypeError
@@ -93,72 +103,206 @@ export default function Page() {
   function reset() {
     setFile(null);
     setResult(null);
+    setDatasetName("");
+    setTarget("");
     setError("");
+    setActiveTab("upload");
+  }
+
+  if (viewMode === "landing") {
+    return <Landing onLaunchStudio={() => setViewMode("studio")} />;
   }
 
   return (
-    <div className={"wrap" + (result ? " wide" : "")}>
-      <div className="brand">
-        <h1>ResearchAI Studio</h1>
-        <span>Automated data preprocessing</span>
-      </div>
+    <div className="studio-app-shell">
+      {/* Sidebar matching reference dashboard */}
+      <aside className="studio-sidebar">
+        <div className="sidebar-brand" onClick={() => setViewMode("landing")}>
+          <div className="brand-icon-box small">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path d="M12 2v8M4.93 10.93 9.17 15.17M2 18h20M20 18v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2M7 14h10l-2-4H9l-2 4Z" />
+            </svg>
+          </div>
+          <div className="sidebar-brand-text">
+            <span className="sidebar-brand-name">Model Forge</span>
+            <span className="sidebar-brand-tag">Studio</span>
+          </div>
+        </div>
 
-      {!result && (
-        <div
-          className={"drop" + (over ? " over" : "")}
-          onClick={() => inputRef.current?.click()}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setOver(true);
-          }}
-          onDragLeave={() => setOver(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setOver(false);
-            pick(e.dataTransfer.files?.[0]);
-          }}
-        >
-          <h2>Drop a dataset here, or click to browse</h2>
-          <p>CSV or Excel · up to {MAX_MB} MB</p>
-          <input
-            ref={inputRef}
-            type="file"
-            accept={ALLOWED.join(",")}
-            hidden
-            onChange={(e) => pick(e.target.files?.[0])}
-          />
-          {file && (
-            <div className="filechip">
-              <span>📄 {file.name}</span>
-              <span>· {(file.size / 1024 / 1024).toFixed(2)} MB</span>
+        <nav className="sidebar-nav">
+          <div className="sidebar-nav-section">INGESTION</div>
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "upload" ? "active" : ""}`}
+            onClick={() => setActiveTab("upload")}
+          >
+            <span className="nav-btn-icon">📂</span>
+            <span className="nav-btn-text">Upload Dataset</span>
+            {file && <span className="nav-pill-dot green" title="Dataset selected"></span>}
+          </button>
+
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "preview" ? "active" : ""}`}
+            onClick={() => result && setActiveTab("preview")}
+            disabled={!result}
+          >
+            <span className="nav-btn-icon">👁️</span>
+            <span className="nav-btn-text">Dataset Preview</span>
+            {!result && <span className="nav-lock-badge">🔒</span>}
+          </button>
+
+          <div className="sidebar-nav-section">ML PIPELINE</div>
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "insights" ? "active" : ""}`}
+            onClick={() => result && setActiveTab("insights")}
+            disabled={!result}
+          >
+            <span className="nav-btn-icon">🛡️</span>
+            <span className="nav-btn-text">Quality Audit</span>
+            {!result && <span className="nav-lock-badge">🔒</span>}
+          </button>
+
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "cleaning" ? "active" : ""}`}
+            onClick={() => result && setActiveTab("cleaning")}
+            disabled={!result}
+          >
+            <span className="nav-btn-icon">🧹</span>
+            <span className="nav-btn-text">Data Cleaning</span>
+            {!result && <span className="nav-lock-badge">🔒</span>}
+          </button>
+
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "eda" ? "active" : ""}`}
+            onClick={() => result && setActiveTab("eda")}
+            disabled={!result}
+          >
+            <span className="nav-btn-icon">📊</span>
+            <span className="nav-btn-text">Visual EDA</span>
+            {!result && <span className="nav-lock-badge">🔒</span>}
+          </button>
+
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "preprocessing" ? "active" : ""}`}
+            onClick={() => result && setActiveTab("preprocessing")}
+            disabled={!result}
+          >
+            <span className="nav-btn-icon">⚙️</span>
+            <span className="nav-btn-text">ML Preprocessing</span>
+            {!result && <span className="nav-lock-badge">🔒</span>}
+          </button>
+        </nav>
+
+        <div className="sidebar-footer">
+          <div className="sidebar-profile-card">
+            <div className="profile-avatar">👤</div>
+            <div className="profile-meta">
+              <span className="profile-name">ML Workspace</span>
+              <span className="profile-status">● Session Active</span>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            className="btn-sidebar-back"
+            onClick={() => setViewMode("landing")}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path d="M19 12H5M12 19l-7-7 7-7" />
+            </svg>
+            <span>Back to Home</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Studio Content Area */}
+      <main className="studio-main-viewport">
+        {/* Top Header */}
+        <header className="studio-header-strip">
+          <div className="header-breadcrumbs">
+            <span className="bc-home" onClick={() => setViewMode("landing")}>Model Forge</span>
+            <span className="bc-divider">/</span>
+            <span className="bc-active">
+              {activeTab === "upload" || !result
+                ? "Dataset Ingestion"
+                : `${result.filename} · ${
+                    activeTab === "preview"
+                      ? "Dataset Preview"
+                      : activeTab === "insights"
+                      ? "Quality Audit"
+                      : activeTab === "cleaning"
+                      ? "Data Cleaning"
+                      : activeTab === "eda"
+                      ? "Visual EDA"
+                      : "ML Preprocessing"
+                  }`}
+            </span>
+          </div>
+
+          <div className="header-status-area">
+            {result && (
+              <div className="loaded-dataset-chip">
+                <span>📄 {result.filename}</span>
+                <span className="chip-count">({result.profile?.rows} rows)</span>
+              </div>
+            )}
+            <div className="server-status-pill">
+              <span className="status-dot"></span>
+              <span>Local API (8000)</span>
+            </div>
+          </div>
+        </header>
+
+        {/* Content Container */}
+        <div className="studio-view-canvas">
+          {activeTab === "upload" || !result ? (
+            <DatasetUpload
+              file={file}
+              setFile={pick}
+              datasetName={datasetName}
+              setDatasetName={setDatasetName}
+              taskType={taskType}
+              setTaskType={setTaskType}
+              loading={loading}
+              error={error}
+              onAnalyze={analyze}
+              onReset={reset}
+            />
+          ) : activeTab === "preview" ? (
+            <DatasetPreview
+              data={result}
+              onProceed={() => setActiveTab("insights")}
+              onClean={() => setActiveTab("cleaning")}
+              target={target}
+              setTarget={setTarget}
+            />
+          ) : (
+            <div className="wrap wide" style={{ padding: "16px 0 60px" }}>
+              <Report
+                data={result}
+                setData={setResult}
+                onReset={reset}
+                tab={activeTab}
+                setTab={setActiveTab}
+                target={target}
+                setTarget={setTarget}
+              />
             </div>
           )}
         </div>
-      )}
-
-      {!result && (
-        <div className="row">
-          <button className="primary" onClick={analyze} disabled={!file || loading}>
-            {loading ? "Analyzing…" : "Analyze dataset"}
-          </button>
-          {file && (
-            <button className="ghost" onClick={reset}>
-              Clear
-            </button>
-          )}
-        </div>
-      )}
-
-      {error && <div className="error">{error}</div>}
-
-      {result && <Report data={result} setData={setResult} onReset={reset} />}
+      </main>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
 
-function Report({ data, setData, onReset }) {
+function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveTabProp, target: targetProp, setTarget: setTargetProp }) {
   const { profile, report, filename } = data;
   const info = profile.columns_info;
   const checks = report.checks;
@@ -167,16 +311,18 @@ function Report({ data, setData, onReset }) {
   const semType = {};
   for (const c of checks.column_types.columns) semType[c.column] = c.detected_type;
 
-  // Target is the USER's choice -- no auto-default. Everything (AI plan, chat,
-  // preprocessing) waits until they pick the outcome they want to predict.
-  const [target, setTarget] = useState("");
+  const [localTarget, setLocalTarget] = useState("");
+  const target = targetProp !== undefined ? targetProp : localTarget;
+  const setTarget = setTargetProp || setLocalTarget;
   const task = !target
     ? ""
     : semType[target] === "numeric"
       ? "regression"
       : "classification"; // boolean/categorical (and anything else) -> classification
 
-  const [tab, setTab] = useState("insights");
+  const [localTab, setLocalTab] = useState("insights");
+  const tab = activeTabProp || localTab;
+  const setTab = setActiveTabProp || setLocalTab;
 
   // LLM plan (clean + preprocess suggestions). Optional overlay: on failure the
   // tabs fall back to rule-based defaults. Fetched once per dataset.

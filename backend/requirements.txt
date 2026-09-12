@@ -9,3 +9,5 @@ matplotlib
 seaborn
 scikit-learn
 imbalanced-learn
+torch
+torchvision
