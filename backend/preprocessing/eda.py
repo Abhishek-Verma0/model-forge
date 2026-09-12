@@ -20,6 +20,7 @@ from profiler import is_numeric  # noqa: E402
 sns.set_theme(style="whitegrid")
 
 MAX_NUMERIC = 8       # cap per-column charts so a wide dataset doesn't render 100 images
+MAX_MISSMAP_COLS = 40 # missing-value map gets unreadable past this many columns
 MAX_PAIRPLOT = 5      # pairplot is O(k^2) panels
 SCATTER_SAMPLE = 5000 # sample rows before plotting points
 
@@ -48,6 +49,17 @@ def render_charts(df):
         ax2.set_title(f"{col} — box")
         charts.append({"title": col, "image": _png(fig)})
 
+    # missing-value map -- where the gaps are, not just how many (skip if none)
+    na = df.isna()
+    if na.to_numpy().any():
+        sub = df.loc[:, na.any()] if na.any().sum() > MAX_MISSMAP_COLS else df
+        sub = sub.iloc[:, :MAX_MISSMAP_COLS]
+        rows = sub.sample(SCATTER_SAMPLE, random_state=0).sort_index() if len(sub) > SCATTER_SAMPLE else sub
+        fig, ax = plt.subplots(figsize=(min(2 + 0.4 * sub.shape[1], 10), 3))
+        sns.heatmap(rows.isna(), cbar=False, cmap="viridis", yticklabels=False, ax=ax)
+        ax.set_title("Missing values (light = missing)")
+        charts.append({"title": "Missing-value map", "image": _png(fig)})
+
     # correlation heatmap (>= 2 numeric)
     if len(numeric) >= 2:
         side = min(1 + len(numeric), 8)
@@ -74,4 +86,8 @@ if __name__ == "__main__":
     d = pd.DataFrame({"a": range(50), "b": [x * 2 for x in range(50)], "c": list("xy") * 25})
     out = render_charts(d)
     assert out and all(c["image"].startswith("data:image/png;base64,") for c in out)
+    titles = [c["title"] for c in out]
+    assert "Missing-value map" not in titles, "no gaps -> no map"
+    d.loc[0, "a"] = None
+    assert "Missing-value map" in [c["title"] for c in render_charts(d)]
     print(f"eda self-check passed ({len(out)} charts)")

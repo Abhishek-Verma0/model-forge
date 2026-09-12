@@ -36,6 +36,12 @@ _SCALERS = {"standard": StandardScaler, "robust": RobustScaler, "minmax": MinMax
 _IMPUTE = {"mean", "median", "most_frequent", "constant"}
 _ENCODE = {"onehot", "ordinal"}
 _OUTLIER = {"clip_iqr", "remove_rows", "zscore", "winsorize"}
+# Defaults for op parameters the user can override per column (the UI sends them).
+IQR_K = 1.5              # clip_iqr / remove_rows fence width
+ZSCORE_THRESHOLD = 3.0   # zscore cutoff, in std devs
+WINSOR_LOWER = 0.05
+WINSOR_UPPER = 0.95
+
 _OPS = {"impute", "encode", "scale", "outliers", "drop_column", "drop_rows_missing"}
 
 
@@ -61,13 +67,21 @@ def _is_intlike(series):
     return len(s) > 0 and is_numeric(s) and bool((s % 1 == 0).all())
 
 
-def _iqr_bounds(series, k=1.5):
+def _iqr_bounds(series, k=None):
+    k = IQR_K if k is None else float(k)
     s = pd.to_numeric(series, errors="coerce").dropna()
     q1, q3 = s.quantile(0.25), s.quantile(0.75)
     iqr = q3 - q1
     if iqr == 0:
         return -np.inf, np.inf  # zero spread -> nothing to clip
     return q1 - k * iqr, q3 + k * iqr
+
+
+def _float(s):
+    """Column as plain float64. Advanced imputation hands back Int64 columns, and
+    writing a fractional bound/fill into an Int64 raises -- so every per-column op
+    works in float and `_as_int` restores whole numbers at the end."""
+    return pd.to_numeric(s, errors="coerce").astype("float64")
 
 
 def _as_int(tr, te, col):
@@ -81,6 +95,9 @@ def _impute(op, col, tr, te, intlike):
     if not is_numeric(tr[col]):
         tr[col] = tr[col].replace(r"^\s*$", np.nan, regex=True)
         te[col] = te[col].replace(r"^\s*$", np.nan, regex=True)
+
+    if is_numeric(tr[col]):
+        tr[col], te[col] = _float(tr[col]), _float(te[col])
 
     if strat in ("mean", "median"):
         vals = pd.to_numeric(tr[col], errors="coerce")
@@ -116,16 +133,18 @@ def _outliers(op, col, tr, te, intlike):
     method = op.get("method", "clip_iqr")
     if method == "remove_rows":
         return tr, te
-    s = pd.to_numeric(tr[col], errors="coerce")
+    s = _float(tr[col])
     if method == "zscore":
+        z = float(op.get("threshold", ZSCORE_THRESHOLD))
         m, sd = s.mean(), s.std()
-        lo, hi = (m - 3 * sd, m + 3 * sd) if sd else (-np.inf, np.inf)
+        lo, hi = (m - z * sd, m + z * sd) if sd else (-np.inf, np.inf)
     elif method == "winsorize":
-        lo, hi = s.quantile(0.05), s.quantile(0.95)
+        lo, hi = (s.quantile(float(op.get("lower", WINSOR_LOWER))),
+                  s.quantile(float(op.get("upper", WINSOR_UPPER))))
     else:  # clip_iqr
-        lo, hi = _iqr_bounds(tr[col])
-    tr[col] = pd.to_numeric(tr[col], errors="coerce").clip(lo, hi)
-    te[col] = pd.to_numeric(te[col], errors="coerce").clip(lo, hi)
+        lo, hi = _iqr_bounds(tr[col], op.get("k"))
+    tr[col] = _float(tr[col]).clip(lo, hi)
+    te[col] = _float(te[col]).clip(lo, hi)
     if intlike:
         _as_int(tr, te, col)
     return tr, te
@@ -149,12 +168,19 @@ def _encode(op, col, tr, te, intlike):
 _DISPATCH = {"impute": _impute, "scale": _scale, "outliers": _outliers, "encode": _encode}
 
 
-def apply_plan(df, target, columns, task="classification", test_size=0.2,
-               random_state=42, pipeline=None):
+def apply_plan(df, target, columns, task="classification", test_size=None,
+               random_state=None, pipeline=None, stratify=True):
     """Run a validated per-column op plan, fit on train only. Returns preview,
     cleaned CSV, and a per-column change summary. `pipeline` = optional
     dataset-level stage (advanced impute / outlier removal / feature selection /
-    imbalance / reduction), all fit on train -- see advanced.py."""
+    imbalance / reduction), all fit on train -- see advanced.py.
+
+    test_size / random_state default to 0.2 / 42 so the same settings
+    reproduce the same split; `stratify=False` forces a plain random split."""
+    test_size = 0.2 if test_size is None else float(test_size)
+    random_state = 42 if random_state is None else int(random_state)
+    if not 0.05 <= test_size <= 0.5:
+        raise ValueError(f"test_size must be between 0.05 and 0.5 (got {test_size}).")
     if target not in df.columns:
         raise ValueError(f"Target '{target}' is not a column in this dataset.")
     for _c, ops in columns.items():
@@ -176,9 +202,10 @@ def apply_plan(df, target, columns, task="classification", test_size=0.2,
         raise ValueError("Too few rows left to split (need at least 5).")
 
     X, y = df[feats], df[target]
-    stratify = y if (task == "classification" and y.nunique() > 1 and y.value_counts().min() >= 2) else None
+    strat = y if (stratify and task == "classification" and y.nunique() > 1
+                  and y.value_counts().min() >= 2) else None
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=stratify
+        X, y, test_size=test_size, random_state=random_state, stratify=strat
     )
 
     # ---- dataset-level: advanced imputation (numeric block, fit on train) ----
@@ -186,7 +213,9 @@ def apply_plan(df, target, columns, task="classification", test_size=0.2,
     _imp = advanced._m("imputation", pipeline)
     if _imp:
         intlike_cols = {c for c in feats if _is_intlike(df[c])}
-        X_tr, X_te, _n = advanced.advanced_impute(X_tr, X_te, _imp, intlike_cols)
+        X_tr, X_te, _n = advanced.advanced_impute(
+            X_tr, X_te, _imp, intlike_cols,
+            (pipeline.get("imputation") or {}).get("n_neighbors"))
         pipe_notes.append(_n)
 
     # remove_rows outliers: drop offending TRAIN rows only (dropping test rows
@@ -228,7 +257,9 @@ def apply_plan(df, target, columns, task="classification", test_size=0.2,
     # ---- dataset-level pipeline on the assembled numeric matrix (fit on train) ----
     class_weights = None
     if advanced._m("outlier_removal", pipeline):
-        tr_out, y_tr, _n = advanced.remove_outliers(tr_out, y_tr, advanced._m("outlier_removal", pipeline))
+        tr_out, y_tr, _n = advanced.remove_outliers(
+            tr_out, y_tr, advanced._m("outlier_removal", pipeline),
+            (pipeline.get("outlier_removal") or {}).get("contamination"))
         pipe_notes.append(_n)
     if advanced._m("feature_selection", pipeline):
         k = (pipeline.get("feature_selection") or {}).get("k", 10)
@@ -257,7 +288,9 @@ def apply_plan(df, target, columns, task="classification", test_size=0.2,
         "features_in": len(feats),
         "features_out": tr_out.shape[1] - 2,  # minus target + __split__
         "dropped_columns": drop_cols,
-        "stratified": stratify is not None,
+        "stratified": strat is not None,
+        "test_size": test_size,
+        "random_state": random_state,
         "summary": summary,
         "pipeline": pipe_notes,
         "class_weights": class_weights,
@@ -275,7 +308,15 @@ def _label(name, op, ncols):
         m = op.get("method", "onehot")
         return f"encode({m})" + (f" -> {ncols} cols" if m == "onehot" else "")
     if name == "outliers":
-        return f"outliers({op.get('method', 'clip_iqr')})"
+        m = op.get("method", "clip_iqr")
+        if m == "zscore":
+            return f"outliers(zscore, {float(op.get('threshold', ZSCORE_THRESHOLD)):g} sd)"
+        if m == "winsorize":
+            return (f"outliers(winsorize, "
+                    f"{float(op.get('lower', WINSOR_LOWER)):g}-{float(op.get('upper', WINSOR_UPPER)):g})")
+        if m in ("clip_iqr", "remove_rows"):
+            return f"outliers({m}, k={float(op.get('k', IQR_K)):g})"
+        return f"outliers({m})"
     return name
 
 
@@ -303,3 +344,37 @@ if __name__ == "__main__":
     assert any(col.startswith("sex_") for col in cleaned.columns)
     assert out["train_rows"] + out["test_rows"] == 10
     print("execute self-check passed:", [s["column"] + ":" + str(s["ops"]) for s in out["summary"]])
+
+    # split settings are honoured and recorded (plan §10 / MVP reproducibility)
+    assert out["test_size"] == 0.2 and out["random_state"] == 42
+    wide = apply_plan(df, "label", plan, test_size=0.3, random_state=7)
+    assert wide["test_rows"] == 3 and wide["random_state"] == 7, wide["test_rows"]
+    # same seed -> same split; different seed -> (almost surely) a different one
+    a = apply_plan(df, "label", plan, random_state=1)["preview"]
+    assert a == apply_plan(df, "label", plan, random_state=1)["preview"], "seed must reproduce the split"
+    assert not apply_plan(df, "label", plan, stratify=False)["stratified"]
+    for bad in (0.9, 0.01):
+        try:
+            apply_plan(df, "label", plan, test_size=bad)
+            raise AssertionError(f"test_size={bad} should have been rejected")
+        except ValueError:
+            pass
+    # per-op outlier parameters override the config defaults
+    tight = apply_plan(df, "label", {"bmi": [{"op": "outliers", "method": "zscore", "threshold": 0.5}]})
+    loose = apply_plan(df, "label", {"bmi": [{"op": "outliers", "method": "zscore", "threshold": 3}]})
+    assert tight["preview"] != loose["preview"], "zscore threshold must change the clipping"
+    # the chosen parameter must reach the summary, or the report can't cite it (plan §15)
+    assert "0.5 sd" in str(tight["summary"]), tight["summary"]
+    kk = apply_plan(df, "label", {"bmi": [{"op": "outliers", "method": "clip_iqr", "k": 2.5}]})
+    assert "k=2.5" in str(kk["summary"]), kk["summary"]
+
+    # regression: advanced imputation returns Int64 columns, and every outlier
+    # method writes fractional bounds -- zscore/winsorize used to raise TypeError.
+    whole = pd.DataFrame({"a": [float(i) for i in range(39)] + [900.0],
+                          "b": [i % 7 for i in range(40)], "y": ["p", "q"] * 20})
+    for m in ("clip_iqr", "zscore", "winsorize", "remove_rows"):
+        r = apply_plan(whole, "y", {"a": [{"op": "outliers", "method": m}]},
+                       pipeline={"imputation": {"method": "knn"}})
+        assert r["train_rows"] > 0, m
+    print("int64-after-advanced-impute regression passed")
+    print("split + parameter self-check passed")

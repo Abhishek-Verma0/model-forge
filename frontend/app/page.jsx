@@ -218,7 +218,7 @@ function Report({ data, setData, onReset }) {
     setTab("eda");
   }
 
-  const score = qualityScore(profile, report);
+  const { score, grade, deductions } = report.quality_score;
   const numericCols = profile.column_names.filter((n) => info[n].type === "numeric");
 
   function download() {
@@ -284,7 +284,10 @@ function Report({ data, setData, onReset }) {
             v={`${num(profile.duplicate_rows)} (${checks.duplicate_rows.summary.duplicate_percent}%)`}
           />
           <Stat k="Missing cells" v={num(checks.missing_values.summary.total_missing_cells)} />
-          <Stat k="Quality score" v={score + "/100"} color={scoreColor(score)} />
+          <Stat k="Quality score" v={score + "/100"} color={scoreColor(score)}
+                note={deductions.length
+                  ? `${grade} — ${deductions.map((d) => `−${d.points} ${d.reason}`).join(", ")}`
+                  : "nothing wrong found"} />
           <Stat
             k="Issue types"
             v={`${report.total_issue_types_found} / ${Object.keys(report.issues_found).length}`}
@@ -562,35 +565,24 @@ function Table({ head, rows }) {
   );
 }
 
-function Stat({ k, v, color }) {
+function Stat({ k, v, color, note }) {
   return (
-    <div className="card">
+    <div className="card" title={note || undefined}>
       <div className="k">{k}</div>
       <div className="v" style={color ? { color } : undefined}>
         {v}
       </div>
+      {note && <div className="note" style={{ fontSize: 11, marginTop: 2 }}>{note}</div>}
     </div>
   );
 }
 
 // ---- helpers ----
 
-// Heuristic 0–100 score. Transparent on purpose; tune the weights later.
-// ponytail: naive weighted penalty, replace with a real rubric if the plan defines one.
-function qualityScore(profile, report) {
-  const cols = Object.values(profile.columns_info);
-  const missingFrac =
-    cols.reduce((s, c) => s + (c.missing_percent || 0) / 100, 0) / (cols.length || 1);
-  const dupFrac = profile.rows ? profile.duplicate_rows / profile.rows : 0;
-  const other = ["outliers", "constant_columns", "id_columns", "high_cardinality", "value_issues", "consistency_issues"].filter(
-    (k) => report.issues_found[k]
-  ).length;
-  const score = 100 - 40 * missingFrac - 20 * dupFrac - 5 * other;
-  return Math.max(0, Math.min(100, Math.round(score)));
-}
-
+// Score comes from the backend (detector.quality_score) so report.json and any
+// future PDF cite the same number the screen shows. Thresholds match its grades.
 function scoreColor(s) {
-  return s >= 80 ? "var(--good)" : s >= 55 ? "var(--warn)" : "var(--bad)";
+  return s >= 85 ? "var(--good)" : s >= 70 ? "var(--warn)" : "var(--bad)";
 }
 
 function issueDetail(key, checks) {

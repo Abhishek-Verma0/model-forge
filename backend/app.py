@@ -26,8 +26,9 @@ import plot                                                      # noqa: E402
 import clean                                                     # noqa: E402
 import execute                                                   # noqa: E402
 import llm                                                       # noqa: E402
+import config                                                    # noqa: E402
 
-MAX_BYTES = 200 * 1024 * 1024
+MAX_BYTES = config.MAX_UPLOAD_MB * 1024 * 1024
 ALLOWED = {".csv", ".xlsx", ".xls"}
 
 # Uploaded dataframes kept in memory so the chart builder can request charts by
@@ -43,7 +44,7 @@ CLEANED = OrderedDict()
 app = FastAPI(title="ResearchAI Studio - Preprocessing API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=config.CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -84,7 +85,7 @@ async def analyze(file: UploadFile):
     if not raw:
         raise HTTPException(422, "File is empty.")
     if len(raw) > MAX_BYTES:
-        raise HTTPException(413, f"File too large ({len(raw) // 1024 // 1024} MB). Max 200 MB.")
+        raise HTTPException(413, f"File too large ({len(raw) // 1024 // 1024} MB). Max {config.MAX_UPLOAD_MB} MB.")
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(raw)
@@ -142,7 +143,7 @@ def plan(payload: dict = Body(...)):
     try:
         return llm.recommend_plan(context)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(503, f"AI plan unavailable (is Ollama running?): {exc}") from None
+        raise HTTPException(503, f"AI plan unavailable ({llm.HINT()}): {exc}") from None
 
 
 @app.post("/api/clean")
@@ -166,8 +167,9 @@ def do_clean(payload: dict = Body(...)):
 @app.post("/api/preprocess")
 def do_preprocess(payload: dict = Body(...)):
     """Apply a validated per-column op plan (fit on train only), return a preview
-    + change summary. Body: {id, target, task, columns}. Cleaned CSV stashed for
-    /api/download."""
+    + change summary. Body: {id, target, task, columns, test_size?, random_state?,
+    stratify?}. Split settings fall back to 80:20 / seed 42. Cleaned CSV
+    stashed for /api/download."""
     df = STORE.get(payload.get("id"))
     if df is None:
         raise HTTPException(404, "Dataset not found (server may have restarted). Re-upload.")
@@ -178,6 +180,9 @@ def do_preprocess(payload: dict = Body(...)):
             df, payload["target"], payload.get("columns", {}),
             task=payload.get("task", "classification"),
             pipeline=payload.get("pipeline"),
+            test_size=payload.get("test_size"),
+            random_state=payload.get("random_state"),
+            stratify=payload.get("stratify", True),
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
@@ -189,23 +194,23 @@ def do_preprocess(payload: dict = Body(...)):
 
 @app.post("/api/chat")
 def chat_api(payload: dict = Body(...)):
-    """Multi-turn preprocessing assistant (Ollama), streamed as plain-text chunks.
+    """Multi-turn preprocessing assistant, streamed as plain-text chunks.
     Optional -- 503 if the LLM is down (raised before streaming starts)."""
     try:
         gen = llm.chat_stream(payload.get("messages", []), payload.get("context", {}))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(503, f"AI chat unavailable (is Ollama running?): {exc}") from None
+        raise HTTPException(503, f"AI chat unavailable ({llm.HINT()}): {exc}") from None
     return StreamingResponse(gen, media_type="text/plain")
 
 
 @app.post("/api/explain")
 def explain(payload: dict = Body(...)):
-    """Plain-English explanation of a preprocessing plan (Ollama). Optional:
+    """Plain-English explanation of a preprocessing plan. Optional:
     if the LLM is down, the app still works -- this just returns 503."""
     try:
         return {"text": llm.explain_recipe(payload)}
     except Exception as exc:  # noqa: BLE001 -- surface any LLM/transport failure as unavailable
-        raise HTTPException(503, f"AI explanation unavailable (is Ollama running?): {exc}") from None
+        raise HTTPException(503, f"AI explanation unavailable ({llm.HINT()}): {exc}") from None
 
 
 @app.get("/api/download")

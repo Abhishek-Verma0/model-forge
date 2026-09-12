@@ -10,6 +10,18 @@ const MISSING_OPTS = ["none", "median", "mean", "most_frequent", "constant", "dr
 const SCALE_OPTS = ["none", "standard", "robust", "minmax"];
 const OUTLIER_OPTS = ["none", "clip_iqr", "zscore", "winsorize", "remove_rows"];
 const ENCODE_OPTS = ["none", "onehot", "ordinal", "drop"];
+
+// Tunable parameters per outlier method. These change the DATA, so they ride on
+// the op (not a server setting) and land in the run summary -- same seed + same
+// parameters must reproduce the same result.
+const OUTLIER_PARAMS = {
+  clip_iqr:    [{ key: "k", label: "IQR k", def: 1.5, step: 0.1, min: 0.1 }],
+  remove_rows: [{ key: "k", label: "IQR k", def: 1.5, step: 0.1, min: 0.1 }],
+  zscore:      [{ key: "threshold", label: "sd", def: 3, step: 0.5, min: 0.1 }],
+  winsorize:   [{ key: "lower", label: "low q", def: 0.05, step: 0.01, min: 0, max: 0.49 },
+                { key: "upper", label: "high q", def: 0.95, step: 0.01, min: 0.51, max: 1 }],
+};
+const pval = (step, method, p) => step.params?.[method]?.[p.key] ?? p.def;
 const IMPUTE = ["median", "mean", "most_frequent", "constant"];
 const MAX_ONEHOT = 50;
 
@@ -20,6 +32,12 @@ const OUTREM_OPTS = ["none", "isolation_forest"];
 const FS_OPTS = ["none", "correlation", "chi2", "anova", "mutual_info", "rfe"];
 const IMB_OPTS = ["none", "oversample", "undersample", "smote", "class_weights"];
 const RED_OPTS = ["none", "pca"];
+const SPLIT_OPTS = [
+  { v: 0.3, label: "70 : 30" },
+  { v: 0.25, label: "75 : 25" },
+  { v: 0.2, label: "80 : 20" },
+  { v: 0.1, label: "90 : 10" },
+];
 
 function meta(data, target) {
   const { profile, report } = data;
@@ -58,7 +76,11 @@ function toOps(step, numeric) {
   if (IMPUTE.includes(step.missing)) ops.push({ op: "impute", strategy: step.missing });
   else if (step.missing === "drop_rows") ops.push({ op: "drop_rows_missing" });
   if (numeric) {
-    if (step.outliers !== "none") ops.push({ op: "outliers", method: step.outliers });
+    if (step.outliers !== "none") {
+      const op = { op: "outliers", method: step.outliers };
+      for (const p of OUTLIER_PARAMS[step.outliers] || []) op[p.key] = Number(pval(step, step.outliers, p));
+      ops.push(op);
+    }
     if (step.scale !== "none") ops.push({ op: "scale", method: step.scale });
   } else if (step.encode === "onehot" || step.encode === "ordinal") {
     ops.push({ op: "encode", method: step.encode });
@@ -74,7 +96,12 @@ function stepFromOps(ops, numeric) {
     else if (o.op === "impute") step.missing = o.strategy || "median";
     else if (o.op === "drop_rows_missing") step.missing = "drop_rows";
     else if (o.op === "scale") step.scale = o.method || "standard";
-    else if (o.op === "outliers") step.outliers = o.method || "clip_iqr";
+    else if (o.op === "outliers") {
+      step.outliers = o.method || "clip_iqr";
+      for (const p of OUTLIER_PARAMS[step.outliers] || []) {
+        if (o[p.key] != null) step.params = { ...step.params, [step.outliers]: { ...step.params?.[step.outliers], [p.key]: o[p.key] } };
+      }
+    }
     else if (o.op === "encode") step.encode = o.method || "onehot";
   }
   return step;
@@ -93,8 +120,11 @@ function opCode(step, numeric, col) {
   if (fills[step.missing]) lines.push(`${c} = ${c}.fillna(${fills[step.missing]})  # train-fitted`);
   else if (step.missing === "drop_rows") lines.push(`df = df.dropna(subset=["${col}"])`);
   if (numeric) {
-    if (step.outliers === "clip_iqr") lines.push(`${c} = ${c}.clip(lower, upper)  # IQR bounds from train`);
-    if (step.outliers === "remove_rows") lines.push(`train = train[within_iqr("${col}")]  # train rows only`);
+    const k = pval(step, step.outliers, OUTLIER_PARAMS.clip_iqr[0]);
+    if (step.outliers === "clip_iqr") lines.push(`${c} = ${c}.clip(lower, upper)  # Q1/Q3 ± ${k}·IQR from train`);
+    if (step.outliers === "remove_rows") lines.push(`train = train[within_iqr("${col}", k=${k})]  # train rows only`);
+    if (step.outliers === "zscore") lines.push(`${c} = ${c}.clip(mean ± ${pval(step, "zscore", OUTLIER_PARAMS.zscore[0])}·std)  # train stats`);
+    if (step.outliers === "winsorize") lines.push(`${c} = ${c}.clip(*train.quantile([${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[0])}, ${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[1])}]))`);
     const sc = { standard: "StandardScaler", robust: "RobustScaler", minmax: "MinMaxScaler" }[step.scale];
     if (sc) lines.push(`${c} = ${sc}().fit(train[["${col}"]]).transform(...)`);
   } else {
@@ -113,7 +143,10 @@ function ruleNote(step, numeric) {
     drop_rows: "rows with gaps removed" }[step.missing];
   if (f) bits.push(f);
   if (numeric) {
-    const o = { clip_iqr: "extreme values capped to IQR bounds", remove_rows: "extreme training rows removed" }[step.outliers];
+    const o = { clip_iqr: `extreme values capped to ${pval(step, "clip_iqr", OUTLIER_PARAMS.clip_iqr[0])}×IQR bounds`,
+      remove_rows: "extreme training rows removed",
+      zscore: `values beyond ${pval(step, "zscore", OUTLIER_PARAMS.zscore[0])} standard deviations capped`,
+      winsorize: `capped to the ${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[0])}–${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[1])} quantile range` }[step.outliers];
     if (o) bits.push(o);
     const s = { robust: "scaled by median/IQR (outlier-safe)", standard: "standardized", minmax: "squeezed to 0–1" }[step.scale];
     if (s) bits.push(s);
@@ -151,13 +184,16 @@ export function recommendedPlan(data, target, task) {
 }
 
 const sameStep = (a, b) =>
-  a.missing === b.missing && a.scale === b.scale && a.outliers === b.outliers && a.encode === b.encode;
+  a.missing === b.missing && a.scale === b.scale && a.outliers === b.outliers && a.encode === b.encode &&
+  JSON.stringify(a.params || {}) === JSON.stringify(b.params || {});
 
 // AI's dataset-level pipeline -> our flat control state (missing sections = "none").
 function pipelineFromAI(p) {
   return {
     imputation: p.imputation?.method || "none",
+    knn_n: p.imputation?.n_neighbors || 5,
     outlier_removal: p.outlier_removal?.method || "none",
+    contamination: p.outlier_removal?.contamination || 0.05,
     feature_selection: p.feature_selection?.method || "none",
     fs_k: p.feature_selection?.k || 10,
     imbalance: p.imbalance?.method || "none",
@@ -169,8 +205,13 @@ function pipelineFromAI(p) {
 export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan }) {
   const { info, semType, missPct, feats } = meta(data, target);
   const [steps, setSteps] = useState(() => defaultSteps(data, target));
+  // Train/test split -- plan §10 wants these user-chosen, and a recorded seed is
+  // what makes a run reproducible. Defaults mirror the backend config.
+  const [split, setSplit] = useState({ test_size: 0.2, random_state: 42, stratify: true });
+  const setSp = (k, v) => setSplit((s) => ({ ...s, [k]: v }));
+
   const [pipeline, setPipeline] = useState({
-    imputation: "none", outlier_removal: "none",
+    imputation: "none", knn_n: 5, outlier_removal: "none", contamination: 0.05,
     feature_selection: "none", fs_k: 10,
     imbalance: "none", reduction: "none", red_n: 2,
   });
@@ -205,6 +246,11 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   const baseline = (col) => aiSteps[col] || defaultSteps(data, target)[col];
   const changedCount = feats.filter((c) => !sameStep(steps[c], baseline(c))).length;
 
+  function setParam(col, method, key, value) {
+    setSteps((s) => ({ ...s, [col]: { ...s[col],
+      params: { ...s[col].params, [method]: { ...s[col].params?.[method], [key]: value } } } }));
+  }
+
   function setStep(col, field, value) {
     setSteps((s) => ({ ...s, [col]: { ...s[col], [field]: value } }));
   }
@@ -226,8 +272,13 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   // dataset-level control state -> the backend `pipeline` object (omit "none").
   function buildPipeline() {
     const p = {};
-    if (pipeline.imputation !== "none") p.imputation = { method: pipeline.imputation };
-    if (pipeline.outlier_removal !== "none") p.outlier_removal = { method: pipeline.outlier_removal };
+    if (pipeline.imputation !== "none") {
+      p.imputation = { method: pipeline.imputation };
+      if (pipeline.imputation === "knn") p.imputation.n_neighbors = Number(pipeline.knn_n) || 5;
+    }
+    if (pipeline.outlier_removal !== "none")
+      p.outlier_removal = { method: pipeline.outlier_removal,
+                            contamination: Number(pipeline.contamination) || 0.05 };
     if (pipeline.feature_selection !== "none")
       p.feature_selection = { method: pipeline.feature_selection, k: Number(pipeline.fs_k) || 10 };
     if (pipeline.imbalance !== "none") p.imbalance = { method: pipeline.imbalance };
@@ -243,7 +294,11 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
       const res = await fetch(`${API}/api/preprocess`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: data.id, target, task, columns, pipeline: buildPipeline() }),
+        body: JSON.stringify({
+          id: data.id, target, task, columns, pipeline: buildPipeline(),
+          test_size: Number(split.test_size), random_state: Number(split.random_state),
+          stratify: split.stratify,
+        }),
       });
       if (!res.ok) {
         let d = `Error ${res.status}`;
@@ -286,6 +341,30 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         </div>
       </div>
 
+      {/* Train/test split -- ratio, seed, stratify */}
+      <div className="panel" style={{ padding: 16, marginBottom: 12 }}>
+        <p style={{ margin: "0 0 4px", fontWeight: 600, fontSize: 14 }}>Train / test split</p>
+        <p className="note" style={{ margin: "0 0 10px" }}>
+          Same seed + same settings reproduce the same split.
+        </p>
+        <div className="builder-row">
+          <label className="pp-field"><span>Split</span>
+            <select value={split.test_size} onChange={(e) => setSp("test_size", e.target.value)}>
+              {SPLIT_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+            </select>
+          </label>
+          <label className="pp-field"><span>Random seed</span>
+            <input type="number" min="0" value={split.random_state}
+                   onChange={(e) => setSp("random_state", e.target.value)} />
+          </label>
+          <label className="pp-field"><span>Stratified</span>
+            <input type="checkbox" checked={split.stratify}
+                   disabled={task !== "classification"}
+                   onChange={(e) => setSp("stratify", e.target.checked)} />
+          </label>
+        </div>
+      </div>
+
       {/* Dataset-level steps (optional) -- act on the whole train matrix */}
       <div className="panel" style={{ padding: 16, marginBottom: 12 }}>
         <p style={{ margin: "0 0 4px", fontWeight: 600, fontSize: 14 }}>Dataset-level steps (optional)</p>
@@ -298,11 +377,23 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
               {ADV_IMPUTE_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
+          {pipeline.imputation === "knn" && (
+            <label className="pp-field" style={{ maxWidth: 92 }}><span>neighbours</span>
+              <input type="number" min="1" step="1" value={pipeline.knn_n}
+                     onChange={(e) => setPipe("knn_n", e.target.value)} />
+            </label>
+          )}
           <label className="pp-field"><span>Outlier removal</span>
             <select value={pipeline.outlier_removal} onChange={(e) => setPipe("outlier_removal", e.target.value)}>
               {OUTREM_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
+          {pipeline.outlier_removal !== "none" && (
+            <label className="pp-field" style={{ maxWidth: 110 }}><span>contamination</span>
+              <input type="number" min="0.01" max="0.49" step="0.01" value={pipeline.contamination}
+                     onChange={(e) => setPipe("contamination", e.target.value)} />
+            </label>
+          )}
           <label className="pp-field"><span>Feature selection</span>
             <select value={pipeline.feature_selection} onChange={(e) => setPipe("feature_selection", e.target.value)}>
               {FS_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
@@ -378,6 +469,16 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                       {OUTLIER_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </label>
+                  {/* Parameters appear only for the method actually chosen, pre-filled
+                      with the default -- the guided path stays one click (plan §8.4). */}
+                  {(OUTLIER_PARAMS[step.outliers] || []).map((p) => (
+                    <label className="pp-field" key={p.key} style={{ maxWidth: 92 }}>
+                      <span>{p.label}</span>
+                      <input type="number" step={p.step} min={p.min} max={p.max}
+                             value={pval(step, step.outliers, p)}
+                             onChange={(e) => setParam(col, step.outliers, p.key, e.target.value)} />
+                    </label>
+                  ))}
                   <label className="pp-field">
                     <span>Scale</span>
                     <select value={step.scale} onChange={(e) => setStep(col, "scale", e.target.value)}>
@@ -409,7 +510,9 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           <div className="target-note" style={{ marginBottom: 10 }}>
             {result.rows_before.toLocaleString()} rows · {result.features_in} → {result.features_out} features ·
             train/test {result.train_rows.toLocaleString()}/{result.test_rows.toLocaleString()} ·
-            {result.stratified ? " stratified split" : " random split"}
+            {result.stratified ? " stratified" : " random"} split
+            {` ${Math.round((1 - result.test_size) * 100)}:${Math.round(result.test_size * 100)}`} ·
+            seed {result.random_state}
             {result.dropped_columns.length > 0 && ` · dropped: ${result.dropped_columns.join(", ")}`}
           </div>
 

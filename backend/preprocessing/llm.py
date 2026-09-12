@@ -2,10 +2,110 @@ import json
 
 import requests
 
-from config import OLLAMA_MODEL, OLLAMA_URL
+import config
+from config import OLLAMA_MODEL, OLLAMA_URL, LLM_TIMEOUT
 import clean as _clean
 import execute as _execute
 import advanced as _advanced
+
+
+# Ollama's chat endpoint (multi-turn), derived from the generate URL.
+OLLAMA_CHAT_URL = OLLAMA_URL.replace("/generate", "/chat")
+
+def HINT():
+    """Named in the 503 so the message points at the backend actually in use."""
+    chain = config.provider_chain()
+    tried = " then ".join(chain)
+    fix = {"ollama": "is Ollama running?", "huggingface": "check HF_TOKEN and HF_MODEL",
+           "gemini": "check GEMINI_API_KEY and GEMINI_MODEL"}[chain[-1]]
+    return f"tried {tried} -- {fix}" if len(chain) > 1 else fix
+
+
+# Hugging Face and Gemini both speak OpenAI's chat-completions shape, so they
+# share one request path; only (url, key, model) differ. Ollama is the odd one out.
+def _openai_target(provider):
+    if provider == "gemini":
+        return config.GEMINI_URL, config.GEMINI_API_KEY, config.GEMINI_MODEL
+    return config.HF_URL, config.HF_TOKEN, config.HF_MODEL
+
+
+def _first_working(call):
+    """Run `call(provider)` down the configured chain, returning the first success.
+    Raises with every failure named, so a 503 says what was actually tried."""
+    failures = []
+    for provider in config.provider_chain():
+        try:
+            return call(provider)
+        except Exception as exc:                      # noqa: BLE001 -- any transport/HTTP error
+            failures.append(f"{provider}: {type(exc).__name__} {str(exc)[:120]}")
+    raise RuntimeError("; ".join(failures) or "no LLM backend configured")
+
+
+def _complete_one(provider, prompt, json_mode):
+    if provider == "ollama":
+        body = {"model": config.OLLAMA_MODEL, "prompt": prompt, "stream": False, "think": False}
+        if json_mode:
+            body["format"] = "json"
+        r = requests.post(config.OLLAMA_URL, json=body, timeout=LLM_TIMEOUT)
+        r.raise_for_status()
+        return r.json()["response"]
+
+    url, key, model = _openai_target(provider)
+    body = {"model": model, "stream": False, "messages": [{"role": "user", "content": prompt}]}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    r = requests.post(url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=LLM_TIMEOUT)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _complete(prompt, json_mode=False):
+    """One-shot prompt -> text, from the first backend in the chain that answers."""
+    return _first_working(lambda p: _complete_one(p, prompt, json_mode))
+
+
+def _parse_chunk(line):
+    """(text, done) from one streamed line. Handles BOTH wire formats -- Ollama
+    sends bare NDJSON, the OpenAI-compatible APIs send SSE ('data: {...}',
+    'data: [DONE]') -- so the generator below stays provider-agnostic."""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    line = line.strip()
+    if not line:
+        return "", False
+    if line.startswith("data:"):
+        line = line[5:].strip()
+        if line == "[DONE]":
+            return "", True
+    try:
+        d = json.loads(line)
+    except json.JSONDecodeError:
+        return "", False
+    if "choices" in d:                                    # OpenAI / Hugging Face / Gemini
+        c = (d.get("choices") or [{}])[0]
+        piece = (c.get("delta") or c.get("message") or {}).get("content") or ""
+        return piece, c.get("finish_reason") is not None
+    return d.get("message", {}).get("content", ""), bool(d.get("done"))   # Ollama
+
+
+def _stream_one(provider, messages):
+    if provider == "ollama":
+        resp = requests.post(OLLAMA_CHAT_URL, stream=True, timeout=LLM_TIMEOUT,
+                             json={"model": config.OLLAMA_MODEL, "messages": messages,
+                                   "stream": True, "think": False})
+    else:
+        url, key, model = _openai_target(provider)
+        resp = requests.post(url, headers={"Authorization": f"Bearer {key}"},
+                             stream=True, timeout=LLM_TIMEOUT,
+                             json={"model": model, "messages": messages, "stream": True})
+    resp.raise_for_status()
+    return resp
+
+
+def _open_stream(messages):
+    """POST a chat request with streaming on. Connects HERE, before any bytes are
+    yielded, so a dead backend can still fall through to the next one."""
+    return _first_working(lambda p: _stream_one(p, messages))
 
 
 def analyze_dataset(profile):
@@ -41,20 +141,7 @@ Keep the explanation concise and easy for a non-technical researcher
 to understand.
 """
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "think": False
-        },
-        timeout=500
-    )
-
-    response.raise_for_status()
-
-    return response.json()["response"]
+    return _complete(prompt)
 
 
 def explain_recipe(plan):
@@ -74,13 +161,7 @@ why. GROUP similar actions (e.g. "20 mostly-empty columns will be dropped") -- d
 list every column. Call out if many columns are dropped, or a free-text column is
 dropped. Do not invent anything not in the plan."""
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "think": False},
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()["response"].strip()
+    return _complete(prompt).strip()
 
 
 def _extract_json(text):
@@ -201,19 +282,8 @@ Example values per column:
 Sample rows:
 {json.dumps(context.get('sample', []))}"""
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": OLLAMA_MODEL,
-              "prompt": _PLAN_SYSTEM + "\n\n" + user,
-              "stream": False, "think": False, "format": "json"},
-        timeout=300,
-    )
-    response.raise_for_status()
-    return _validate_plan(_extract_json(response.json()["response"]))
-
-
-# Ollama's chat endpoint (multi-turn), derived from the generate URL.
-OLLAMA_CHAT_URL = OLLAMA_URL.replace("/generate", "/chat")
+    text = _complete(_PLAN_SYSTEM + "\n\n" + user, json_mode=True)
+    return _validate_plan(_extract_json(text))
 
 
 def chat_stream(messages, context):
@@ -235,23 +305,46 @@ Answer their questions about WHY and WHICH preprocessing to do, in plain, short 
 steer back to preprocessing."""
 
     payload = [{"role": "system", "content": system}] + list(messages)
-    resp = requests.post(
-        OLLAMA_CHAT_URL,
-        json={"model": OLLAMA_MODEL, "messages": payload, "stream": True, "think": False},
-        stream=True,
-        timeout=300,
-    )
-    resp.raise_for_status()
+    resp = _open_stream(payload)
 
     def gen():
         for line in resp.iter_lines():
-            if not line:
-                continue
-            data = json.loads(line)
-            piece = data.get("message", {}).get("content", "")
+            piece, done = _parse_chunk(line)
             if piece:
                 yield piece
-            if data.get("done"):
+            if done:
                 break
 
     return gen()
+
+if __name__ == "__main__":
+    # Stream parsing is the only branchy bit -- both wire formats, no network.
+    ollama = [b'{"message":{"content":"Hel"}}', b'{"message":{"content":"lo"}}',
+              b'{"message":{"content":""},"done":true}']
+    hf = [b'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+          b'data: {"choices":[{"delta":{"content":"lo"}}]}',
+          b'', b'data: [DONE]']
+    for name, lines in (("ollama", ollama), ("huggingface", hf)):
+        out, stopped = "", False
+        for ln in lines:
+            piece, done = _parse_chunk(ln)
+            out += piece
+            if done:
+                stopped = True
+                break
+        assert out == "Hello", (name, out)
+        assert stopped, f"{name} stream never signalled done"
+    assert _parse_chunk(b"not json") == ("", False)      # junk must not kill the stream
+    assert _parse_chunk(b"") == ("", False)
+    assert _extract_json('prose {"a": 1} tail') == {"a": 1}
+    assert _extract_json("no json here") == {}
+    # the chain must try every configured backend before giving up, and say so
+    seen = []
+    try:
+        _first_working(lambda p: seen.append(p) or (_ for _ in ()).throw(RuntimeError("boom")))
+    except RuntimeError as e:
+        assert seen == config.provider_chain(), (seen, config.provider_chain())
+        assert all(p in str(e) for p in seen), e          # every failure named
+    assert _first_working(lambda p: f"ok:{p}") == f"ok:{config.provider_chain()[0]}"
+    assert isinstance(HINT(), str) and HINT()
+    print(f"llm self-check passed (chain={config.provider_chain()}, both stream formats parse)")

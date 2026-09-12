@@ -3,7 +3,8 @@
 import { useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const KINDS = ["histogram", "density", "box", "violin", "scatter", "bar", "pie", "tsne"];
+const KINDS = ["histogram", "density", "box", "violin", "scatter", "line", "bar", "pie", "tsne"];
+const NEEDS_Y = ["scatter", "line"];   // plotted against a second column
 
 // User-driven charts: pick a type + column(s) + optional color/group, and the
 // backend renders that exact chart (matplotlib/seaborn) as a PNG we <img>.
@@ -18,7 +19,7 @@ export default function ChartBuilder({ data }) {
 
   if (!id) return null; // backend hasn't added the dataset store / id yet
 
-  const needsY = kind === "scatter";
+  const needsY = NEEDS_Y.includes(kind);
   const params = new URLSearchParams({ id, kind, x });
   if (needsY) params.set("y", y);
   if (hue) params.set("hue", hue);

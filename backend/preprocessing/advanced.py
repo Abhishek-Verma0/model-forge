@@ -10,8 +10,8 @@ assembled *numeric* feature matrix (imputation is the exception -- it runs early
 before encoding, on the numeric columns).
 
 pipeline = {
-  "imputation":      {"method": "knn"|"iterative"},          # numeric block, train-fit
-  "outlier_removal": {"method": "isolation_forest"},         # drops TRAIN rows only
+  "imputation":      {"method": "knn"|"iterative", "n_neighbors": 5},  # numeric block, train-fit
+  "outlier_removal": {"method": "isolation_forest", "contamination": 0.05},  # drops TRAIN rows only
   "feature_selection":{"method": "correlation"|"chi2"|"anova"|"mutual_info"|"rfe", "k": 10},
   "imbalance":       {"method": "oversample"|"undersample"|"smote"|"class_weights"},
   "reduction":       {"method": "pca", "n": 5},
@@ -25,6 +25,10 @@ scatter/pairplot already cover 2-D visualization.
 
 import numpy as np
 import pandas as pd
+
+CONTAMINATION = 0.05      # IsolationForest expected outlier share (pipeline can override)
+KNN_NEIGHBORS = 5         # KNNImputer neighbours (pipeline can override)
+ITERATIVE_MAX_ITER = 10
 
 _IMPUTE = {"knn", "iterative"}
 _OUTREM = {"isolation_forest"}
@@ -46,11 +50,17 @@ def validate_pipeline(p):
         m = _m(section, p)
         if m and m not in allowed:
             raise ValueError(f"{section}.method must be one of {sorted(allowed)} (got '{m}')")
+    c = (p.get("outlier_removal") or {}).get("contamination")
+    if c is not None and not 0 < float(c) < 0.5:
+        raise ValueError(f"outlier_removal.contamination must be between 0 and 0.5 (got {c}).")
+    k = (p.get("imputation") or {}).get("n_neighbors")
+    if k is not None and int(k) < 1:
+        raise ValueError(f"imputation.n_neighbors must be at least 1 (got {k}).")
 
 
 # --- advanced imputation (numeric block, before encoding) -------------------
 
-def advanced_impute(X_tr, X_te, method, intlike_cols):
+def advanced_impute(X_tr, X_te, method, intlike_cols, n_neighbors=None):
     """KNN / iterative imputation of ALL numeric feature columns at once, fit on
     train. Returns (X_tr, X_te, note). intlike_cols are rounded back to integers."""
     from sklearn.impute import KNNImputer
@@ -60,9 +70,9 @@ def advanced_impute(X_tr, X_te, method, intlike_cols):
     if method == "iterative":
         from sklearn.experimental import enable_iterative_imputer  # noqa: F401
         from sklearn.impute import IterativeImputer
-        imp = IterativeImputer(random_state=0, max_iter=10)
+        imp = IterativeImputer(random_state=0, max_iter=ITERATIVE_MAX_ITER)
     else:
-        imp = KNNImputer()
+        imp = KNNImputer(n_neighbors=int(n_neighbors or KNN_NEIGHBORS))
     imp.fit(X_tr[num])
     X_tr = X_tr.copy(); X_te = X_te.copy()
     X_tr[num] = imp.transform(X_tr[num])
@@ -76,8 +86,9 @@ def advanced_impute(X_tr, X_te, method, intlike_cols):
 
 # --- multivariate outlier removal (train rows only) -------------------------
 
-def remove_outliers(X_tr, y_tr, method, contamination=0.05):
+def remove_outliers(X_tr, y_tr, method, contamination=None):
     from sklearn.ensemble import IsolationForest
+    contamination = CONTAMINATION if contamination is None else float(contamination)
     num = X_tr.select_dtypes("number")
     if num.shape[1] == 0:
         return X_tr, y_tr, "no numeric columns for outlier detection"

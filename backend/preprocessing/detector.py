@@ -4,6 +4,16 @@ import pandas as pd
 
 from profiler import is_numeric, empty_string_mask
 
+# Detection thresholds. Deliberately NOT user-tunable: a researcher overrides the
+# VERDICT (untick the suggested drop on the Cleaning tab), not the dial -- "is
+# patient_code an ID?" is a judgement call, 0.95 is not a number they can reason about.
+IQR_MULTIPLIER = 1.5
+CATEGORICAL_THRESHOLD = 0.5
+MAX_CATEGORICAL_UNIQUE = 50
+ID_RATIO_THRESHOLD = 0.95
+CARDINALITY_THRESHOLD = 0.5
+CARDINALITY_MIN_UNIQUE = 20
+
 
 def detect_missing_values(df, detect_empty_strings=True):
     """
@@ -92,13 +102,14 @@ def detect_duplicates(df, subset=None):
     }
 
 
-def detect_outliers(df, iqr_multiplier=1.5):
+def detect_outliers(df, iqr_multiplier=None):
     """
     Detect outliers in numeric columns using the IQR method.
 
     Returns:
         dict: Structured report for the AI reasoning layer.
     """
+    iqr_multiplier = IQR_MULTIPLIER if iqr_multiplier is None else float(iqr_multiplier)
 
     total_rows = len(df)
     columns_with_outliers = []
@@ -215,7 +226,7 @@ _BOOLEAN_VALUE_SETS = [
 DATETIME_SAMPLE = 1000
 
 
-def detect_column_types(df, categorical_threshold=0.5, max_categorical_unique=50):
+def detect_column_types(df, categorical_threshold=None, max_categorical_unique=None):
     """
     Classify each column into a semantic type beyond the raw pandas dtype:
     boolean, datetime, numeric, categorical, or text.
@@ -225,6 +236,10 @@ def detect_column_types(df, categorical_threshold=0.5, max_categorical_unique=50
     Returns:
         dict: Structured report for the AI reasoning layer.
     """
+    categorical_threshold = (CATEGORICAL_THRESHOLD if categorical_threshold is None
+                             else float(categorical_threshold))
+    max_categorical_unique = (MAX_CATEGORICAL_UNIQUE if max_categorical_unique is None
+                              else int(max_categorical_unique))
 
     total_rows = len(df)
     columns = []
@@ -291,7 +306,7 @@ def detect_column_types(df, categorical_threshold=0.5, max_categorical_unique=50
     }
 
 
-def detect_id_columns(df, id_ratio_threshold=0.95):
+def detect_id_columns(df, id_ratio_threshold=None):
     """
     Detect candidate identifier (ID) columns.
 
@@ -308,6 +323,8 @@ def detect_id_columns(df, id_ratio_threshold=0.95):
     Returns:
         dict: Structured report for the AI reasoning layer.
     """
+    id_ratio_threshold = (ID_RATIO_THRESHOLD if id_ratio_threshold is None
+                          else float(id_ratio_threshold))
 
     total_rows = len(df)
     id_columns = []
@@ -343,7 +360,7 @@ def detect_id_columns(df, id_ratio_threshold=0.95):
     }
 
 
-def detect_high_cardinality(df, cardinality_threshold=0.5, min_unique=20):
+def detect_high_cardinality(df, cardinality_threshold=None, min_unique=None):
     """
     Detect high-cardinality categorical/text columns.
 
@@ -362,6 +379,9 @@ def detect_high_cardinality(df, cardinality_threshold=0.5, min_unique=20):
     Returns:
         dict: Structured report for the AI reasoning layer.
     """
+    cardinality_threshold = (CARDINALITY_THRESHOLD if cardinality_threshold is None
+                             else float(cardinality_threshold))
+    min_unique = CARDINALITY_MIN_UNIQUE if min_unique is None else int(min_unique)
 
     total_rows = len(df)
     high_cardinality_columns = []
@@ -540,6 +560,39 @@ def detect_consistency_issues(df):
     }
 
 
+def quality_score(checks, df):
+    """0-100 dataset health, from checks already computed -- no second pass.
+
+    Only counts things that are genuinely WRONG with the data. Outliers, ID and
+    high-cardinality columns are deliberately excluded: they are modelling notes,
+    not defects, and penalising them makes a clean dataset look dirty.
+
+    Every deduction is returned with the score, because an unexplained number is
+    worse than no number -- the user must see why it is 72. ponytail: the weights
+    are a judgement call, not a standard; tune them if they mis-rank real data.
+    """
+    rows, cols = max(len(df), 1), max(len(df.columns), 1)
+    pct = lambda n, d: 100.0 * n / max(d, 1)
+
+    # only the two value issues that are real defects; negatives/zeros are data
+    broken = sum(1 for c in checks["value_issues"]["columns"]
+                 if {"numeric_stored_as_text", "whitespace_values"} & set(c["issues"]))
+
+    items = [  # (label, points off) -- each capped so one check can't sink the score
+        ("missing values", min(30.0, pct(checks["missing_values"]["summary"]["total_missing_cells"],
+                                         rows * cols) * 1.5)),
+        ("duplicate rows", min(20.0, checks["duplicate_rows"]["summary"]["duplicate_percent"] * 1.5)),
+        ("constant columns", min(15.0, pct(len(checks["constant_columns"]["columns"]), cols))),
+        ("inconsistent categories", min(20.0, pct(len(checks["consistency_issues"]["columns"]), cols))),
+        ("malformed values", min(15.0, pct(broken, cols))),
+    ]
+    deductions = [{"reason": label, "points": round(pts, 1)} for label, pts in items if pts > 0]
+    score = round(max(0.0, 100.0 - sum(p for _, p in items)), 1)
+    grade = ("good" if score >= 85 else "fair" if score >= 70 else
+             "poor" if score >= 50 else "very poor")
+    return {"score": score, "grade": grade, "deductions": deductions}
+
+
 def run_quality_report(df):
     """
     Run every detector and return one unified data-quality report.
@@ -585,7 +638,24 @@ def run_quality_report(df):
             "total_columns": len(df.columns),
             "column_names": list(df.columns),
         },
+        "quality_score": quality_score(checks, df),
         "issues_found": issues_found,
         "total_issue_types_found": sum(1 for v in issues_found.values() if v),
         "checks": checks,
     }
+
+if __name__ == "__main__":
+    import pandas as pd
+    clean = pd.DataFrame({"a": range(40), "b": [i * 1.5 for i in range(40)],
+                          "c": ["x", "y"] * 20})
+    dirty = pd.concat([clean.assign(c=None, d=1)] * 2, ignore_index=True)
+    cs = quality_score(run_quality_report(clean)["checks"], clean)
+    ds = quality_score(run_quality_report(dirty)["checks"], dirty)
+    assert cs["score"] == 100 and not cs["deductions"], cs   # clean data loses nothing
+    assert cs["score"] > ds["score"], (cs, ds)          # dirtier data must score lower
+    assert 0 <= ds["score"] <= 100 and cs["score"] <= 100
+    assert ds["deductions"], "a bad dataset must say WHY it lost points"
+    # the score is only ever the deductions subtracted from 100
+    assert abs(100 - sum(d["points"] for d in ds["deductions"]) - ds["score"]) < 0.2
+    print(f"quality score self-check passed: clean={cs['score']} ({cs['grade']}) "
+          f"dirty={ds['score']} ({ds['grade']}) because {[d['reason'] for d in ds['deductions']]}")
