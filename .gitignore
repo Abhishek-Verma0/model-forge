@@ -28,3 +28,6 @@ backend/preprocessing/report.json
 # OS
 .DS_Store
 Thumbs.db
+
+
+docs/
