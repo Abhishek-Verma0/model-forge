@@ -62,26 +62,29 @@ def validate_pipeline(p):
 
 def advanced_impute(X_tr, X_te, method, intlike_cols, n_neighbors=None):
     """KNN / iterative imputation of ALL numeric feature columns at once, fit on
-    train. Returns (X_tr, X_te, note). intlike_cols are rounded back to integers."""
+    train. Returns (X_tr, X_te, note, state); impute_apply(state, X) replays it on
+    new rows. intlike_cols are rounded back to integers."""
     from sklearn.impute import KNNImputer
     num = [c for c in X_tr.columns if pd.api.types.is_numeric_dtype(X_tr[c])]
     if not num:
-        return X_tr, X_te, "no numeric columns to impute"
+        return X_tr, X_te, "no numeric columns to impute", None
     if method == "iterative":
         from sklearn.experimental import enable_iterative_imputer  # noqa: F401
         from sklearn.impute import IterativeImputer
         imp = IterativeImputer(random_state=0, max_iter=ITERATIVE_MAX_ITER)
     else:
         imp = KNNImputer(n_neighbors=int(n_neighbors or KNN_NEIGHBORS))
-    imp.fit(X_tr[num])
-    X_tr = X_tr.copy(); X_te = X_te.copy()
-    X_tr[num] = imp.transform(X_tr[num])
-    X_te[num] = imp.transform(X_te[num])
-    for c in num:
-        if c in intlike_cols:  # keep integer semantics (age stays whole)
-            X_tr[c] = X_tr[c].round().astype("Int64")
-            X_te[c] = X_te[c].round().astype("Int64")
-    return X_tr, X_te, f"{method} imputation on {len(num)} numeric column(s)"
+    state = {"imp": imp.fit(X_tr[num]), "num": num, "int": [c for c in num if c in intlike_cols]}
+    return (impute_apply(state, X_tr), impute_apply(state, X_te),
+            f"{method} imputation on {len(num)} numeric column(s)", state)
+
+
+def impute_apply(state, X):
+    X = X.copy()
+    X[state["num"]] = state["imp"].transform(X[state["num"]])
+    for c in state["int"]:  # keep integer semantics (age stays whole)
+        X[c] = X[c].round().astype("Int64")
+    return X
 
 
 # --- multivariate outlier removal (train rows only) -------------------------
@@ -103,10 +106,11 @@ def select_features(X_tr, X_te, y_tr, method, k, task):
         SelectKBest, chi2, f_classif, f_regression,
         mutual_info_classif, mutual_info_regression, RFE,
     )
-    num = X_tr.select_dtypes("number")
+    from functools import partial
+    num = X_tr.select_dtypes("number")  # raw text columns pass through untouched
     k = max(1, min(int(k or 10), num.shape[1]))
     if num.shape[1] <= k:
-        return X_tr, X_te, "fewer features than k -- nothing removed"
+        return X_tr, X_te, "fewer features than k -- nothing removed", None
     y = pd.factorize(y_tr)[0] if task == "classification" else pd.to_numeric(y_tr, errors="coerce")
 
     if method == "correlation":
@@ -126,13 +130,16 @@ def select_features(X_tr, X_te, y_tr, method, k, task):
             score = f_classif if task == "classification" else f_regression
             data = num
         else:  # mutual_info
-            score = mutual_info_classif if task == "classification" else mutual_info_regression
+            # seeded: unseeded mutual info picks different columns on every run
+            score = partial(mutual_info_classif if task == "classification" else mutual_info_regression,
+                            random_state=0)
             data = num
         sel = SelectKBest(score, k=k).fit(data, y)
         keep = num.columns[sel.get_support()].tolist()
 
-    dropped = [c for c in X_tr.columns if c not in keep]
-    return X_tr[keep], X_te[keep], f"{method}: kept {len(keep)} of {num.shape[1]} feature(s), dropped {len(dropped)}"
+    note = f"{method}: kept {len(keep)} of {num.shape[1]} feature(s), dropped {num.shape[1] - len(keep)}"
+    keep += [c for c in X_tr.columns if c not in num.columns]
+    return X_tr[keep], X_te[keep], note, keep
 
 
 # --- class imbalance (train rows only) --------------------------------------
@@ -158,7 +165,8 @@ def balance(X_tr, y_tr, method, task):
             raise ValueError("SMOTE needs imbalanced-learn: pip install imbalanced-learn")
         num = X_tr.select_dtypes("number")
         if num.shape[1] != X_tr.shape[1]:
-            raise ValueError("SMOTE needs an all-numeric feature matrix (encode categoricals first).")
+            raise ValueError("SMOTE needs an all-numeric feature matrix: encode categoricals first, and it "
+                             "can't invent text rows -- use oversample or class_weights with text columns.")
         k = max(1, min(5, int(counts.min()) - 1))
         Xr, yr = SMOTE(random_state=0, k_neighbors=k).fit_resample(X_tr, y_tr)
         return Xr, pd.Series(yr), f"SMOTE resampled {len(X_tr)} -> {len(Xr)} train rows", None
@@ -182,14 +190,20 @@ def reduce(X_tr, X_te, method, n):
     from sklearn.decomposition import PCA
     num = X_tr.select_dtypes("number")
     if num.shape[1] < 2:
-        return X_tr, X_te, "too few numeric features for reduction"
+        return X_tr, X_te, "too few numeric features for reduction", None
     n = max(1, min(int(n or 2), num.shape[1]))
-    pca = PCA(n_components=n, random_state=0).fit(num)
-    cols = [f"pc{i + 1}" for i in range(n)]
-    tr = pd.DataFrame(pca.transform(num), columns=cols, index=X_tr.index)
-    te = pd.DataFrame(pca.transform(X_te.select_dtypes("number")[num.columns]), columns=cols, index=X_te.index)
-    var = round(float(pca.explained_variance_ratio_.sum()) * 100, 1)
-    return tr, te, f"PCA -> {n} component(s), {var}% variance retained"
+    state = {"pca": PCA(n_components=n, random_state=0).fit(num), "num": list(num.columns)}
+    var = round(float(state["pca"].explained_variance_ratio_.sum()) * 100, 1)
+    return (reduce_apply(state, X_tr), reduce_apply(state, X_te),
+            f"PCA -> {n} component(s), {var}% variance retained", state)
+
+
+def reduce_apply(state, X):
+    """Numeric columns -> PCA components; anything else (raw text) passes through."""
+    n = state["pca"].n_components_
+    pcs = pd.DataFrame(state["pca"].transform(X[state["num"]]),
+                       columns=[f"pc{i + 1}" for i in range(n)], index=X.index)
+    return pd.concat([pcs, X.drop(columns=state["num"])], axis=1)
 
 
 if __name__ == "__main__":
@@ -204,7 +218,7 @@ if __name__ == "__main__":
 
     # advanced impute keeps age integer
     Xi = Xtr.copy(); Xi.loc[Xi.index[:5], "age"] = np.nan
-    a_tr, a_te, note = advanced_impute(Xi, Xte.copy(), "knn", {"age"})
+    a_tr, a_te, note, _ = advanced_impute(Xi, Xte.copy(), "knn", {"age"})
     assert str(a_tr["age"].dtype) == "Int64" and a_tr["age"].notna().all(), note
 
     # isolation forest drops some train rows
@@ -213,7 +227,7 @@ if __name__ == "__main__":
 
     # feature selection keeps k
     for meth in ("correlation", "chi2", "anova", "mutual_info", "rfe"):
-        s_tr, s_te, note = select_features(Xtr, Xte, ytr, meth, 2, "classification")
+        s_tr, s_te, note, _ = select_features(Xtr, Xte, ytr, meth, 2, "classification")
         assert s_tr.shape[1] == 2, (meth, note)
 
     # over/under sampling balance the classes
@@ -225,7 +239,7 @@ if __name__ == "__main__":
     assert weights and len(weights) == 2
 
     # PCA reduces to n components on train + test
-    r_tr, r_te, note = reduce(Xtr, Xte, "pca", 2)
+    r_tr, r_te, note, _ = reduce(Xtr, Xte, "pca", 2)
     assert list(r_tr.columns) == ["pc1", "pc2"] and len(r_te) == len(Xte), note
 
     validate_pipeline({"feature_selection": {"method": "chi2", "k": 3}})

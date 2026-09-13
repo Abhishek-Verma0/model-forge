@@ -15,7 +15,9 @@ train-fitted transforms.
 
 plan columns = { "age": [{"op":"impute","strategy":"median"}], ... }
   impute  : strategy = mean | median | most_frequent | constant  (+ fill_value)
-  encode  : method   = onehot | ordinal
+  encode  : method   = onehot | ordinal | text
+            text keeps the raw column; its word + letter TF-IDF is fitted on
+            train and lives in the saved pipeline (to_matrix), not in the CSV.
   scale   : method   = standard | robust | minmax
   outliers: method   = clip_iqr | remove_rows          (remove_rows = TRAIN only)
   drop_column        : drop the column
@@ -25,16 +27,18 @@ plan columns = { "age": [{"op":"impute","strategy":"median"}], ... }
 import json
 
 import numpy as np
+import sklearn
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
 from profiler import is_numeric
 import advanced
+import clean
 
 _SCALERS = {"standard": StandardScaler, "robust": RobustScaler, "minmax": MinMaxScaler}
 _IMPUTE = {"mean", "median", "most_frequent", "constant"}
-_ENCODE = {"onehot", "ordinal"}
+_ENCODE = {"onehot", "ordinal", "text"}
 _OUTLIER = {"clip_iqr", "remove_rows", "zscore", "winsorize"}
 # Defaults for op parameters the user can override per column (the UI sends them).
 IQR_K = 1.5              # clip_iqr / remove_rows fence width
@@ -80,89 +84,102 @@ def _iqr_bounds(series, k=None):
 def _float(s):
     """Column as plain float64. Advanced imputation hands back Int64 columns, and
     writing a fractional bound/fill into an Int64 raises -- so every per-column op
-    works in float and `_as_int` restores whole numbers at the end."""
+    works in float and rounds back to Int64 at the end."""
     return pd.to_numeric(s, errors="coerce").astype("float64")
 
 
-def _as_int(tr, te, col):
-    tr[col] = tr[col].round().astype("Int64")
-    te[col] = te[col].round().astype("Int64")
+# Every per-column op below is fit-or-replay: with st=None it learns its values
+# from `fr` (the TRAIN frame) and returns them as st; given st it only applies
+# them. apply_plan fits on train and replays on test; transform() replays the
+# saved st on new rows -- one code path, so the saved pipeline can't drift.
 
-
-def _impute(op, col, tr, te, intlike):
+def _impute(op, col, fr, st, intlike):
     strat = op.get("strategy", "median")
+    s = fr[col]
     # blank/whitespace strings count as missing too (same rule as the profiler)
-    if not is_numeric(tr[col]):
-        tr[col] = tr[col].replace(r"^\s*$", np.nan, regex=True)
-        te[col] = te[col].replace(r"^\s*$", np.nan, regex=True)
-
-    if is_numeric(tr[col]):
-        tr[col], te[col] = _float(tr[col]), _float(te[col])
-
-    if strat in ("mean", "median"):
-        vals = pd.to_numeric(tr[col], errors="coerce")
-        fill = vals.mean() if strat == "mean" else vals.median()
-    elif strat == "most_frequent":
-        mode = tr[col].mode(dropna=True)
-        fill = mode.iloc[0] if len(mode) else 0
-    else:  # constant
-        fill = op.get("fill_value", 0 if intlike else "Missing")
-
-    tr[col] = tr[col].fillna(fill)
-    te[col] = te[col].fillna(fill)
+    if not is_numeric(s):
+        s = s.replace(r"^\s*$", np.nan, regex=True)
+    if is_numeric(s):
+        s = _float(s)
+    if st is None:
+        if strat in ("mean", "median"):
+            vals = pd.to_numeric(s, errors="coerce")
+            fill = vals.mean() if strat == "mean" else vals.median()
+        elif strat == "most_frequent":
+            mode = s.mode(dropna=True)
+            fill = mode.iloc[0] if len(mode) else 0
+        else:  # constant
+            fill = op.get("fill_value", 0 if intlike else "Missing")
+        st = {"fill": fill}
+    s = s.fillna(st["fill"])
     # median / most_frequent / constant keep integer semantics; mean can be
     # fractional so it's allowed to become float.
-    if intlike and strat != "mean":
-        _as_int(tr, te, col)
-    return tr, te
+    fr[col] = s.round().astype("Int64") if intlike and strat != "mean" else s
+    return fr, st
 
 
-def _scale(op, col, tr, te, intlike):
-    method = op.get("method", "standard")
-    sc = _SCALERS[method]()
-    a_tr = pd.to_numeric(tr[col], errors="coerce").to_numpy().reshape(-1, 1)
-    sc.fit(a_tr)  # fit on train only
-    tr[col] = sc.transform(a_tr).ravel()
-    te[col] = sc.transform(pd.to_numeric(te[col], errors="coerce").to_numpy().reshape(-1, 1)).ravel()
-    return tr, te  # scaling intentionally yields float
+def _scale(op, col, fr, st, intlike):
+    a = pd.to_numeric(fr[col], errors="coerce").to_numpy().reshape(-1, 1)
+    if st is None:
+        st = _SCALERS[op.get("method", "standard")]().fit(a)
+    fr[col] = st.transform(a).ravel()
+    return fr, st  # scaling intentionally yields float
 
 
-def _outliers(op, col, tr, te, intlike):
-    # remove_rows is handled before this loop (it drops train rows); the rest clip
-    # to train-fitted bounds so the column keeps its dtype and shape.
+def _outliers(op, col, fr, st, intlike):
+    # remove_rows drops TRAIN rows before this loop; the rest clip to train-fitted
+    # bounds so the column keeps its dtype and shape.
     method = op.get("method", "clip_iqr")
     if method == "remove_rows":
-        return tr, te
-    s = _float(tr[col])
-    if method == "zscore":
-        z = float(op.get("threshold", ZSCORE_THRESHOLD))
-        m, sd = s.mean(), s.std()
-        lo, hi = (m - z * sd, m + z * sd) if sd else (-np.inf, np.inf)
-    elif method == "winsorize":
-        lo, hi = (s.quantile(float(op.get("lower", WINSOR_LOWER))),
+        return fr, None
+    if st is None:
+        s = _float(fr[col])
+        if method == "zscore":
+            z = float(op.get("threshold", ZSCORE_THRESHOLD))
+            m, sd = s.mean(), s.std()
+            st = (m - z * sd, m + z * sd) if sd else (-np.inf, np.inf)
+        elif method == "winsorize":
+            st = (s.quantile(float(op.get("lower", WINSOR_LOWER))),
                   s.quantile(float(op.get("upper", WINSOR_UPPER))))
-    else:  # clip_iqr
-        lo, hi = _iqr_bounds(tr[col], op.get("k"))
-    tr[col] = _float(tr[col]).clip(lo, hi)
-    te[col] = _float(te[col]).clip(lo, hi)
-    if intlike:
-        _as_int(tr, te, col)
-    return tr, te
+        else:  # clip_iqr
+            st = _iqr_bounds(fr[col], op.get("k"))
+    s = _float(fr[col]).clip(*st)
+    fr[col] = s.round().astype("Int64") if intlike else s
+    return fr, st
 
 
-def _encode(op, col, tr, te, intlike):
+def _text(col, fr, st):
+    """Keep the raw text; fit word 1-2 + letter 3-5 TF-IDF on TRAIN. Best of the
+    options measured on SMS spam (10-fold CV, docs/backlog.md) -- the squashed
+    SVD version lost on every fold. The vectorizers are applied by to_matrix at
+    training time; a CSV can't carry ~100k sparse columns."""
+    s = fr[col].fillna("").astype(str)
+    if st is None:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        try:
+            st = [TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True).fit(s),
+                  TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True).fit(s)]
+        except ValueError:
+            raise ValueError(f"'{col}' has no text to encode (all blank).") from None
+    fr[col] = s
+    return fr, st
+
+
+def _encode(op, col, fr, st, intlike):
     method = op.get("method", "onehot")
-    s_tr, s_te = tr[col].astype("string"), te[col].astype("string")
+    if method == "text":
+        return _text(col, fr, st)
+    s = fr[col].astype("string")
     if method == "ordinal":
-        cats = list(pd.Series(s_tr.dropna().unique()))
-        mp = {v: i for i, v in enumerate(cats)}
-        tr[col] = s_tr.map(mp).fillna(-1).astype("int64")  # unseen -> -1
-        te[col] = s_te.map(mp).fillna(-1).astype("int64")
-        return tr, te
-    # onehot: categories fixed on TRAIN; unseen test categories -> all-zero row.
-    d_tr = pd.get_dummies(s_tr, prefix=col).astype("int64")
-    d_te = pd.get_dummies(s_te, prefix=col).reindex(columns=d_tr.columns, fill_value=0).astype("int64")
-    return d_tr, d_te
+        if st is None:
+            st = {v: i for i, v in enumerate(s.dropna().unique())}
+        fr[col] = s.map(st).fillna(-1).astype("int64")  # unseen -> -1
+        return fr, st
+    # onehot: categories fixed on TRAIN; unseen categories -> all-zero row.
+    d = pd.get_dummies(s, prefix=col)
+    if st is None:
+        st = list(d.columns)
+    return d.reindex(columns=st, fill_value=0).astype("int64"), st
 
 
 _DISPATCH = {"impute": _impute, "scale": _scale, "outliers": _outliers, "encode": _encode}
@@ -210,10 +227,17 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
 
     # ---- dataset-level: advanced imputation (numeric block, fit on train) ----
     pipe_notes = []
+    # Everything learned from train, so new rows get the identical transform
+    # (transform / to_matrix). Row-level steps are training-only and not kept.
+    fitted = {"sklearn": sklearn.__version__, "target": target, "features": feats,
+              "clean_ops": [], "impute": None, "columns": [], "text": {},
+              "keep": None, "pca": None,
+              "settings": {"columns": columns, "pipeline": pipeline, "task": task,
+                           "test_size": test_size, "random_state": random_state}}
     _imp = advanced._m("imputation", pipeline)
     if _imp:
         intlike_cols = {c for c in feats if _is_intlike(df[c])}
-        X_tr, X_te, _n = advanced.advanced_impute(
+        X_tr, X_te, _n, fitted["impute"] = advanced.advanced_impute(
             X_tr, X_te, _imp, intlike_cols,
             (pipeline.get("imputation") or {}).get("n_neighbors"))
         pipe_notes.append(_n)
@@ -235,7 +259,7 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
         te = X_te[[c]].copy()
         intlike = _is_intlike(df[c])
         before = str(df[c].dtype)
-        applied = []
+        applied, replay = [], []
         for o in ops:
             name = o["op"]
             if name in ("drop_rows_missing",):
@@ -243,11 +267,16 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
             if name == "outliers" and o.get("method") == "remove_rows":
                 applied.append("outliers(remove_rows, train)")
                 continue
-            tr, te = _DISPATCH[name](o, c, tr, te, intlike)
-            applied.append(_label(name, o, tr.shape[1]))
+            tr, st = _DISPATCH[name](o, c, tr, None, intlike)
+            te, _ = _DISPATCH[name](o, c, te, st, intlike)
+            replay.append((o, st, intlike))
+            if name == "encode" and o.get("method") == "text":
+                fitted["text"][c] = st
+            applied.append(_label(name, o, tr.shape[1], st))
+        fitted["columns"].append((c, replay))
         tr_parts.append(tr)
         te_parts.append(te)
-        after = f"{tr.shape[1]} one-hot cols" if tr.shape[1] > 1 else str(tr[tr.columns[0]].dtype)
+        after = f"{tr.shape[1]} cols" if tr.shape[1] > 1 else str(tr[tr.columns[0]].dtype)
         summary.append({"column": c, "dtype_before": before, "dtype_after": after,
                         "ops": applied or ["kept as-is"]})
 
@@ -263,12 +292,12 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
         pipe_notes.append(_n)
     if advanced._m("feature_selection", pipeline):
         k = (pipeline.get("feature_selection") or {}).get("k", 10)
-        tr_out, te_out, _n = advanced.select_features(
+        tr_out, te_out, _n, fitted["keep"] = advanced.select_features(
             tr_out, te_out, y_tr, advanced._m("feature_selection", pipeline), k, task)
         pipe_notes.append(_n)
     if advanced._m("reduction", pipeline):
         n = (pipeline.get("reduction") or {}).get("n", 2)
-        tr_out, te_out, _n = advanced.reduce(tr_out, te_out, advanced._m("reduction", pipeline), n)
+        tr_out, te_out, _n, fitted["pca"] = advanced.reduce(tr_out, te_out, advanced._m("reduction", pipeline), n)
         pipe_notes.append(_n)
     if advanced._m("imbalance", pipeline):
         tr_out, y_tr, _n, class_weights = advanced.balance(
@@ -296,16 +325,57 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
         "class_weights": class_weights,
         "preview": json.loads(cleaned.head(20).to_json(orient="records")),
         "csv": cleaned.to_csv(index=False),
+        "fitted": fitted,
     }
 
 
-def _label(name, op, ncols):
+def transform(fitted, df):
+    """Replay a fitted run on NEW raw rows: the recorded clean ops, then every
+    step with its train-fitted values. Training-only row steps (dedupe, drop rows,
+    outlier row removal, resampling) are skipped -- you can't drop a row you
+    were asked to predict."""
+    ops = [o for o in fitted["clean_ops"] if o["op"] != "drop_duplicates"]
+    if ops:
+        df, _ = clean.apply_clean(df, ops)
+    X = df[fitted["features"]].copy()
+    if fitted["impute"]:
+        X = advanced.impute_apply(fitted["impute"], X)
+    parts = []
+    for c, replay in fitted["columns"]:
+        fr = X[[c]].copy()
+        for o, st, intlike in replay:
+            fr, _ = _DISPATCH[o["op"]](o, c, fr, st, intlike)
+        parts.append(fr)
+    out = pd.concat(parts, axis=1)
+    if fitted["keep"] is not None:
+        out = out[fitted["keep"]]
+    if fitted["pca"]:
+        out = advanced.reduce_apply(fitted["pca"], out)
+    return out
+
+
+def to_matrix(fitted, frame):
+    """Model input: the numeric columns plus each raw text column's saved TF-IDF,
+    as one sparse matrix. `frame` = transform() output, or the exported CSV's
+    feature columns."""
+    from scipy.sparse import csr_matrix, hstack
+    text = fitted["text"]
+    blocks = [csr_matrix(frame.drop(columns=list(text)).astype("float64").to_numpy())]
+    for c, vecs in text.items():
+        blocks += [v.transform(frame[c].fillna("").astype(str)) for v in vecs]
+    return hstack(blocks).tocsr()
+
+
+def _label(name, op, ncols, st=None):
     if name == "impute":
         return f"impute({op.get('strategy', 'median')})"
     if name == "scale":
         return f"scale({op.get('method', 'standard')})"
     if name == "encode":
         m = op.get("method", "onehot")
+        if m == "text":
+            terms = sum(len(v.vocabulary_) for v in st)
+            return f"text kept; word+letter tf-idf fit on train ({terms:,} terms, applied at training)"
         return f"encode({m})" + (f" -> {ncols} cols" if m == "onehot" else "")
     if name == "outliers":
         m = op.get("method", "clip_iqr")
@@ -377,4 +447,46 @@ if __name__ == "__main__":
                        pipeline={"imputation": {"method": "knn"}})
         assert r["train_rows"] > 0, m
     print("int64-after-advanced-impute regression passed")
+
+    # saved pipeline: replaying it on the raw TEST rows must reproduce the run's
+    # own test output exactly -- for numbers, categories, text, and dataset steps.
+    import io, joblib
+    from sklearn.linear_model import LogisticRegression
+    words = ["great", "awful", "fast", "broken", "love", "refund", "cheap", "solid"]
+    raw = pd.DataFrame({
+        "Review ": [f" {words[i % 8]} item {words[(i * 3) % 8]} delivery order {i}" for i in range(80)],
+        "age": [None if i % 9 == 0 else 20 + i % 50 for i in range(80)],
+        "bmi": [18 + (i * 7) % 25 + 0.5 for i in range(80)],
+        "sex": ["M", "F", "f"] * 26 + ["M", "F"],
+        "y": ["p", "q"] * 40,
+    })
+    raw.loc[3, "Review "] = None                                         # blank text is fine
+    clean_ops = [{"op": "rename_column", "column": "Review ", "to": "review"},
+                 {"op": "merge_categories", "column": "sex"}]
+    df_c, _ = clean.apply_clean(raw, clean_ops)
+    plan = {"review": [{"op": "encode", "method": "text"}],
+            "age": [{"op": "impute", "strategy": "median"}, {"op": "outliers", "method": "zscore"}],
+            "bmi": [{"op": "scale", "method": "robust"}],
+            "sex": [{"op": "encode", "method": "onehot"}]}
+    r = apply_plan(df_c, "y", plan, pipeline={"imputation": {"method": "knn"},
+                                              "feature_selection": {"method": "anova", "k": 2}})
+    fitted = r["fitted"]
+    fitted["clean_ops"] = clean_ops
+    buf = io.BytesIO(); joblib.dump(fitted, buf); buf.seek(0)
+    fitted = joblib.load(buf)                                            # survives a save/load
+
+    out = pd.read_csv(io.StringIO(r["csv"]))
+    assert out["review"].str.contains("delivery").any()                 # raw text kept in the CSV
+    test_out = out[out["__split__"] == "test"].drop(columns=["y", "__split__"]).reset_index(drop=True)
+    _, raw_te = train_test_split(raw, test_size=0.2, random_state=42, stratify=raw["y"])  # same split
+    replayed = transform(fitted, raw_te.drop(columns=["y"]))
+    replayed = pd.read_csv(io.StringIO(replayed.to_csv(index=False)))    # same text round trip as the CSV
+    pd.testing.assert_frame_equal(replayed, test_out, check_dtype=False)
+
+    train_out = out[out["__split__"] == "train"]
+    X_tr = to_matrix(fitted, train_out.drop(columns=["y", "__split__"]))
+    n_terms = sum(len(v.vocabulary_) for v in fitted["text"]["review"])
+    assert X_tr.shape[1] == test_out.shape[1] - 1 + n_terms, X_tr.shape  # numbers + every text term
+    LogisticRegression(max_iter=500).fit(X_tr, train_out["y"]).predict(to_matrix(fitted, replayed))
+    print("saved-pipeline replay self-check passed:", X_tr.shape, [s["ops"] for s in r["summary"]])
     print("split + parameter self-check passed")

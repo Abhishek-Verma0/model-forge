@@ -5,6 +5,7 @@ anything -- it loads the file and calls the existing profiler + detector +
 charts + eda + plot. profiler.py / detector.py are unchanged.
 """
 
+import io
 import sys
 import json
 import uuid
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent / "preprocessing"))
 from fastapi import FastAPI, UploadFile, HTTPException, Response, Body   # noqa: E402
 from fastapi.responses import StreamingResponse                         # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware                       # noqa: E402
+import joblib                                                            # noqa: E402
 
 from profiler import load_dataset, profile_dataset               # noqa: E402
 from detector import run_quality_report                          # noqa: E402
@@ -37,9 +39,12 @@ ALLOWED = {".csv", ".xlsx", ".xls"}
 STORE = OrderedDict()
 STORE_CAP = 5
 
-# Cleaned CSV per dataset id, produced by /api/preprocess, streamed by /api/download.
-# Kept out of the JSON response so a big cleaned file isn't inlined.
+# (cleaned CSV, fitted pipeline) per dataset id, produced by /api/preprocess and
+# served by /api/download + /api/pipeline. Kept out of the JSON response.
 CLEANED = OrderedDict()
+# Clean ops applied per dataset id, in order -- the saved pipeline replays them
+# on new rows. ponytail: grows one small list per upload until restart.
+CLEAN_LOG = {}
 
 app = FastAPI(title="ResearchAI Studio - Preprocessing API")
 app.add_middleware(
@@ -159,6 +164,7 @@ def do_clean(payload: dict = Body(...)):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     STORE[payload["id"]] = cleaned  # downstream tabs now see the cleaned frame
+    CLEAN_LOG[payload["id"]] = CLEAN_LOG.get(payload["id"], []) + payload.get("ops", [])
     out = _payload(cleaned, payload.get("filename", "cleaned"), payload["id"])
     out["clean_summary"] = summary
     return out
@@ -186,7 +192,9 @@ def do_preprocess(payload: dict = Body(...)):
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    CLEANED[payload["id"]] = result.pop("csv")  # keep the big CSV out of the JSON response
+    fitted = result.pop("fitted")
+    fitted["clean_ops"] = CLEAN_LOG.get(payload["id"], [])
+    CLEANED[payload["id"]] = (result.pop("csv"), fitted)  # keep the big CSV out of the JSON response
     while len(CLEANED) > STORE_CAP:
         CLEANED.popitem(last=False)
     return result
@@ -215,11 +223,24 @@ def explain(payload: dict = Body(...)):
 
 @app.get("/api/download")
 def download(id: str):
-    csv = CLEANED.get(id)
-    if csv is None:
+    if id not in CLEANED:
         raise HTTPException(404, "No cleaned data yet. Run preprocessing first.")
     return Response(
-        content=csv,
+        content=CLEANED[id][0],
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=cleaned.csv"},
     )
+
+
+@app.get("/api/pipeline")
+def download_pipeline(id: str):
+    """The fitted pipeline (joblib): clean ops + every train-fitted step + text
+    TF-IDF. Load with joblib and use execute.transform / execute.to_matrix, same
+    scikit-learn version. Only ever load a pipeline file you produced yourself --
+    joblib files can run code."""
+    if id not in CLEANED:
+        raise HTTPException(404, "No pipeline yet. Run preprocessing first.")
+    buf = io.BytesIO()
+    joblib.dump(CLEANED[id][1], buf)
+    return Response(content=buf.getvalue(), media_type="application/octet-stream",
+                    headers={"Content-Disposition": "attachment; filename=pipeline.joblib"})

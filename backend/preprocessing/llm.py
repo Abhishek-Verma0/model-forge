@@ -237,7 +237,7 @@ Allowed CLEAN ops (applied to the whole table):
   {"op":"drop_duplicates"}
 Allowed PREPROCESS ops (per column, fit on train):
   {"op":"impute","strategy":"mean"|"median"|"most_frequent"|"constant"}
-  {"op":"encode","method":"onehot"|"ordinal"}
+  {"op":"encode","method":"onehot"|"ordinal"|"text"}           # text = kept raw, word+letter tf-idf fit at training
   {"op":"scale","method":"standard"|"robust"|"minmax"}
   {"op":"outliers","method":"clip_iqr"|"zscore"|"winsorize"|"remove_rows"}
 Allowed DATASET-LEVEL pipeline (optional, fit on train, whole matrix):
@@ -252,8 +252,10 @@ Rules:
   -- do NOT add scale unless a model genuinely needs it. Never scale an ID or a category.
 - impute numeric with median (or mean), categorical with most_frequent.
 - encode categoricals (onehot for few categories, ordinal only if there is a real order).
+- encode free-text and many-valued text columns (reviews, notes, cities, product names) with
+  method "text". Do NOT drop a column just because it is text or has many values.
 - scale numeric ONLY when useful; leave it off otherwise.
-- To DROP any unneeded column (free-text / ID / constant / mostly-empty / high-cardinality),
+- To DROP any unneeded column (ID / constant / mostly-empty),
   put a CLEAN drop_column op in "clean". Dropping is a cleaning step, NEVER a preprocess step.
 - rename_column ONLY when a header is messy/unclear (spaces, units, symbols, "col1"); use a short
   snake_case name. Do NOT rename already-clean headers, and never rename the target column.

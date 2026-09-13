@@ -13,6 +13,11 @@ MAX_CATEGORICAL_UNIQUE = 50
 ID_RATIO_THRESHOLD = 0.95
 CARDINALITY_THRESHOLD = 0.5
 CARDINALITY_MIN_UNIQUE = 20
+# Free text = most values distinct AND a typical cell holds several words
+# (AutoGluon's rule). Other many-valued strings -- cities, CPU models, codes -- are
+# "string": short fragments that repeat across rows.
+FREETEXT_MIN_UNIQUE = 0.5
+FREETEXT_MIN_WORDS = 3  # ponytail: median words per cell; 2-word names stay ID-like
 
 
 def detect_missing_values(df, detect_empty_strings=True):
@@ -226,6 +231,18 @@ _BOOLEAN_VALUE_SETS = [
 DATETIME_SAMPLE = 1000
 
 
+def text_kind(series):
+    """'free_text' (reviews, notes) or 'string' (many-valued short labels).
+    Reads the values only -- never the column name, never the target."""
+    s = series.dropna().astype(str)
+    if s.empty:
+        return "string"
+    probe = s if len(s) <= DATETIME_SAMPLE else s.sample(DATETIME_SAMPLE, random_state=0)
+    words = probe.str.split().str.len().median()
+    unique = s.nunique() / len(s)
+    return "free_text" if unique >= FREETEXT_MIN_UNIQUE and words >= FREETEXT_MIN_WORDS else "string"
+
+
 def detect_column_types(df, categorical_threshold=None, max_categorical_unique=None):
     """
     Classify each column into a semantic type beyond the raw pandas dtype:
@@ -293,6 +310,7 @@ def detect_column_types(df, categorical_threshold=None, max_categorical_unique=N
             "detected_type": semantic_type,
             "distinct_values": distinct,
             "unique_ratio": unique_ratio,
+            "text_kind": text_kind(series) if semantic_type == "text" else None,
         })
 
     return {
@@ -339,7 +357,9 @@ def detect_id_columns(df, id_ratio_threshold=None):
         distinct = int(clean.nunique())
         unique_ratio = distinct / total_rows
 
-        if unique_ratio >= id_ratio_threshold:
+        # every review is unique too, but sentences aren't identifiers
+        if (unique_ratio >= id_ratio_threshold
+                and (is_numeric(series) or text_kind(series) != "free_text")):
             id_columns.append({
                 "column": column,
                 "distinct_values": distinct,
@@ -657,5 +677,13 @@ if __name__ == "__main__":
     assert ds["deductions"], "a bad dataset must say WHY it lost points"
     # the score is only ever the deductions subtracted from 100
     assert abs(100 - sum(d["points"] for d in ds["deductions"]) - ds["score"]) < 0.2
+    # free text is kept (not an ID); many-valued short labels are "string"
+    t = pd.DataFrame({"review": [f"great product number {i} works well" for i in range(60)],
+                      "cpu": [f"Intel Core i{3 + i % 3} {i % 5}U" for i in range(60)],  # 15 labels
+                      "code": [f"ORD{i}" for i in range(60)]})
+    kinds = {c["column"]: c["text_kind"] for c in detect_column_types(t)["columns"]}
+    assert kinds == {"review": "free_text", "cpu": None, "code": "string"}, kinds  # cpu: few labels -> categorical
+    ids = [c["column"] for c in detect_id_columns(t)["columns"]]
+    assert "review" not in ids and "code" in ids, ids
     print(f"quality score self-check passed: clean={cs['score']} ({cs['grade']}) "
           f"dirty={ds['score']} ({ds['grade']}) because {[d['reason'] for d in ds['deductions']]}")

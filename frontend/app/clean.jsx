@@ -46,7 +46,7 @@ function gatherFlags(report) {
   }
   for (const c of checks.constant_columns.columns) add(c.column, "constant", { drop: true });
   for (const c of checks.id_columns.columns) add(c.column, "ID-like", { drop: true });
-  for (const c of checks.high_cardinality.columns) add(c.column, "high-cardinality", { drop: true });
+  for (const c of checks.high_cardinality.columns) add(c.column, "many values (text-encoded in Preprocessing)", {});
   return flags;
 }
 

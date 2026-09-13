@@ -9,7 +9,7 @@ const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const MISSING_OPTS = ["none", "median", "mean", "most_frequent", "constant", "drop_rows", "drop_column"];
 const SCALE_OPTS = ["none", "standard", "robust", "minmax"];
 const OUTLIER_OPTS = ["none", "clip_iqr", "zscore", "winsorize", "remove_rows"];
-const ENCODE_OPTS = ["none", "onehot", "ordinal", "drop"];
+const ENCODE_OPTS = ["none", "onehot", "ordinal", "text", "drop"];
 
 // Tunable parameters per outlier method. These change the DATA, so they ride on
 // the op (not a server setting) and land in the run summary -- same seed + same
@@ -47,22 +47,26 @@ function meta(data, target) {
   const missPct = {};
   for (const m of report.checks.missing_values.columns) missPct[m.column] = m.missing_percent;
   const feats = profile.column_names.filter((c) => c !== target);
-  return { info, semType, missPct, feats };
+  const idCols = new Set(report.checks.id_columns.columns.map((c) => c.column));
+  return { info, semType, missPct, feats, idCols };
 }
 
 // Rule-based defaults (instant, offline). Impute missing + encode categoricals.
 // NO scaling by default -- the user adds it only when a model needs it.
 export function defaultSteps(data, target) {
-  const { info, semType, missPct, feats } = meta(data, target);
+  const { info, semType, missPct, feats, idCols } = meta(data, target);
   const steps = {};
   for (const col of feats) {
     const numeric = semType[col] === "numeric";
+    const text = semType[col] === "text";
     const miss = missPct[col] || 0;
     const step = { missing: "none", scale: "none", outliers: "none", encode: "none" };
     if (miss > 60) step.missing = "drop_column"; // mostly empty -> no signal
     else {
-      if (miss > 0) step.missing = numeric ? "median" : "most_frequent";
-      if (!numeric) step.encode = info[col].unique_values > MAX_ONEHOT ? "drop" : "onehot";
+      // text blanks stay blank -- the text encoder handles them; a filled-in review is fake
+      if (miss > 0 && !text) step.missing = numeric ? "median" : "most_frequent";
+      if (!numeric) step.encode = idCols.has(col) ? "drop" : text ? "text"
+        : info[col].unique_values > MAX_ONEHOT ? "drop" : "onehot";
     }
     steps[col] = step;
   }
@@ -84,6 +88,8 @@ function toOps(step, numeric) {
     if (step.scale !== "none") ops.push({ op: "scale", method: step.scale });
   } else if (step.encode === "onehot" || step.encode === "ordinal") {
     ops.push({ op: "encode", method: step.encode });
+  } else if (step.encode === "text") {
+    ops.push({ op: "encode", method: "text" });
   }
   return ops;
 }
@@ -130,6 +136,9 @@ function opCode(step, numeric, col) {
   } else {
     if (step.encode === "onehot") lines.push(`pd.get_dummies(${c}, prefix="${col}")  # fit categories on train`);
     if (step.encode === "ordinal") lines.push(`${c} = ${c}.map(train_category_codes)`);
+    if (step.encode === "text") lines.push(
+      `# ${col} stays as text in the CSV`,
+      `TfidfVectorizer(words 1-2).fit(train["${col}"]) + TfidfVectorizer(letters 3-5).fit(...)  # train only, saved in pipeline`);
   }
   return lines.length ? lines : [`# ${col}: kept as-is`];
 }
@@ -151,7 +160,8 @@ function ruleNote(step, numeric) {
     const s = { robust: "scaled by median/IQR (outlier-safe)", standard: "standardized", minmax: "squeezed to 0–1" }[step.scale];
     if (s) bits.push(s);
   } else {
-    const e = { onehot: "one column per category", ordinal: "mapped to ordered numbers" }[step.encode];
+    const e = { onehot: "one column per category", ordinal: "mapped to ordered numbers",
+      text: "kept as text; its word and letter patterns are learned on train and saved in the pipeline for training" }[step.encode];
     if (e) bits.push(e);
   }
   if (!bits.length) return "Kept as-is — already model-ready.";
@@ -487,12 +497,14 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                   </label>
                 </>
               ) : (
-                <label className="pp-field">
-                  <span>Encode</span>
-                  <select value={step.encode} onChange={(e) => setStep(col, "encode", e.target.value)}>
-                    {ENCODE_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
-                  </select>
-                </label>
+                <>
+                  <label className="pp-field">
+                    <span>Encode</span>
+                    <select value={step.encode} onChange={(e) => setStep(col, "encode", e.target.value)}>
+                      {ENCODE_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  </label>
+                </>
               )}
 
               <pre className="pp-code">{opCode(step, numeric, col).join("\n")}</pre>
@@ -554,6 +566,14 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
             href={`${API}/api/download?id=${data.id}`}
           >
             Download cleaned CSV
+          </a>
+          <a
+            className="ghost"
+            style={{ display: "inline-block", marginTop: 12, marginLeft: 8, padding: "8px 16px", textDecoration: "none" }}
+            href={`${API}/api/pipeline?id=${data.id}`}
+            title="Fitted steps + text TF-IDF, to apply the same preprocessing at training and on new rows"
+          >
+            Download pipeline
           </a>
         </div>
       )}

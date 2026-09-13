@@ -25,7 +25,7 @@ const ISSUE_META = {
   outliers: { label: "Outliers", rec: "IQR clip, z-score, or winsorize" },
   constant_columns: { label: "Constant columns", rec: "Drop (zero variance, no signal)" },
   id_columns: { label: "Possible ID columns", rec: "Exclude from modeling (leaks / no signal)" },
-  high_cardinality: { label: "High-cardinality columns", rec: "Hash / target-encode, or drop" },
+  high_cardinality: { label: "High-cardinality columns", rec: "Text-encode (TF-IDF + SVD) in Preprocessing — kept, not dropped" },
   value_issues: { label: "Value issues", rec: "Convert numbers-stored-as-text, review negatives/zeros" },
   consistency_issues: { label: "Inconsistent categories", rec: "Normalize spellings (Male / male / \" Male\")" },
 };
