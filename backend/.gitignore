@@ -13,6 +13,7 @@ __pycache__/
 
 # Generated
 preprocessing/report.json
+data/
 
 # Secrets
 .env

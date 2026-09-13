@@ -36,12 +36,11 @@ Not built:
 | **List columns** (`"red;blue;green"` → one flag per item) | Not seen in current datasets | When one appears |
 | **Model-native text** (CatBoost `text_features`, TabSTAR, TabPFN text adapter) | Model-phase choices | ML phase evaluation |
 | **Datetime columns** | Still one-hot or dropped (>50 values); no calendar parts | Next data-phase pass |
-| `CLEAN_LOG` in `app.py` keeps one small ops list per upload until restart | Tiny; in-memory store is already restart-scoped | With persistence (DB) |
 
 ## Bugs found, not fixed
 
-- `outliers remove_rows` ignores its `k` parameter (always 1.5×IQR) while the summary label prints the chosen k (`execute.py` remove_rows loop).
-- Regression with missing target values crashes ("Input y contains NaN") — same in old and new code.
+- `outliers remove_rows` used to ignore its `k` (always 1.5×IQR). The row removal left the export in ML groundwork; the per-fold sampler in piece 1 must read the op's `k`.
+- Dataset deletion / retention period (plan §24) not implemented -- files accumulate under backend/data.
 
 ## Still open from the 2026-09-13 data-pipeline audit
 
@@ -49,7 +48,6 @@ Not built:
 - Semicolon CSV read as one column (scores 100/100); decimal comma `3,5` → `35`; dd/mm dates swapped/lost.
 - `.xls` listed as supported but `xlrd` isn't installed.
 - Duplicate removal runs before the ID drop/trim/merge (Cleaning op order) → leakage; repeat subjects cross the split.
-- NaN target rows kept; oversampling written into the exported CSV; clustering blocked (target required).
+- Clustering blocked (target required) -- spec piece 4.
 - Pima-style zeros-as-missing untouched.
 - `reader.py` / `roles.py` exist only as `.pyc` in `__pycache__` — source was never saved.
-- Unpinned `requirements.txt` (env has pandas 3.0.5, scikit-learn 1.9.0) — matters more now: a saved pipeline needs the same scikit-learn to load.

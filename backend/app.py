@@ -2,15 +2,14 @@
 
 Wires the preprocessing modules together over HTTP. It does NOT reimplement
 anything -- it loads the file and calls the existing profiler + detector +
-charts + eda + plot. profiler.py / detector.py are unchanged.
+charts + eda + plot. Datasets, pipelines and runs live on disk (store.py), so a
+restart loses nothing.
 """
 
 import io
 import sys
 import json
-import uuid
 import tempfile
-from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "preprocessing"))
@@ -29,22 +28,11 @@ import clean                                                     # noqa: E402
 import execute                                                   # noqa: E402
 import llm                                                       # noqa: E402
 import config                                                    # noqa: E402
+import store                                                     # noqa: E402
+import jobs                                                      # noqa: E402
 
 MAX_BYTES = config.MAX_UPLOAD_MB * 1024 * 1024
 ALLOWED = {".csv", ".xlsx", ".xls"}
-
-# Uploaded dataframes kept in memory so the chart builder can request charts by
-# id after upload. ponytail: in-memory + single process; a restart clears it
-# (re-upload) -- move to disk/redis for persistence or multiple workers.
-STORE = OrderedDict()
-STORE_CAP = 5
-
-# (cleaned CSV, fitted pipeline) per dataset id, produced by /api/preprocess and
-# served by /api/download + /api/pipeline. Kept out of the JSON response.
-CLEANED = OrderedDict()
-# Clean ops applied per dataset id, in order -- the saved pipeline replays them
-# on new rows. ponytail: grows one small list per upload until restart.
-CLEAN_LOG = {}
 
 app = FastAPI(title="ResearchAI Studio - Preprocessing API")
 app.add_middleware(
@@ -54,13 +42,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Runs left queued/running by a previous process can never finish -- say so.
+jobs.mark_interrupted()
 
-def _store(df):
-    ds_id = uuid.uuid4().hex[:12]
-    STORE[ds_id] = df
-    while len(STORE) > STORE_CAP:
-        STORE.popitem(last=False)  # evict oldest
-    return ds_id
+
+def _frame(ds_id):
+    df = store.load_frame(ds_id)
+    if df is None:
+        raise HTTPException(404, "Dataset not found. Re-upload.")
+    return df
 
 
 def _payload(df, filename, ds_id):
@@ -97,7 +87,7 @@ async def analyze(file: UploadFile):
         tmp_path = tmp.name
     try:
         df = load_dataset(tmp_path)
-        ds_id = _store(df)
+        ds_id = store.create(df, file.filename)
         return _payload(df, file.filename, ds_id)
     except Exception as exc:
         raise HTTPException(422, f"Could not read file: {exc}") from None
@@ -107,9 +97,7 @@ async def analyze(file: UploadFile):
 
 @app.get("/api/chart")
 def chart(id: str, kind: str, x: str = "", y: str = "", hue: str = "", fmt: str = "png"):
-    df = STORE.get(id)
-    if df is None:
-        raise HTTPException(404, "Dataset not found (server may have restarted). Re-upload.")
+    df = _frame(id)
     try:
         img, media = plot.render(df, kind, x=x or None, y=y or None, hue=hue or None, fmt=fmt)
     except ValueError as exc:
@@ -138,9 +126,7 @@ def plan(payload: dict = Body(...)):
     """LLM proposes a structured clean+preprocess plan (validated against the op
     allowlist). Optional -- 503 if Ollama is down; the frontend keeps its rule
     defaults. Body: {id, target, task}."""
-    df = STORE.get(payload.get("id"))
-    if df is None:
-        raise HTTPException(404, "Dataset not found (server may have restarted). Re-upload.")
+    df = _frame(payload.get("id"))
     # target is optional: cleaning suggestions don't need it, so the plan can load
     # on the Cleaning tab before the user has chosen an outcome column.
     context = _llm_context(df, profile_dataset(df), payload.get("target", ""),
@@ -154,17 +140,15 @@ def plan(payload: dict = Body(...)):
 @app.post("/api/clean")
 def do_clean(payload: dict = Body(...)):
     """Apply validated per-cell clean ops to the WHOLE frame (before split),
-    replace the stored frame, and return the re-profiled payload + a summary.
+    save the cleaned frame, and return the re-profiled payload + a summary.
     Body: {id, ops}."""
-    df = STORE.get(payload.get("id"))
-    if df is None:
-        raise HTTPException(404, "Dataset not found (server may have restarted). Re-upload.")
+    df = _frame(payload.get("id"))
     try:
         cleaned, summary = clean.apply_clean(df, payload.get("ops", []))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    STORE[payload["id"]] = cleaned  # downstream tabs now see the cleaned frame
-    CLEAN_LOG[payload["id"]] = CLEAN_LOG.get(payload["id"], []) + payload.get("ops", [])
+    store.save_frame(payload["id"], cleaned)  # downstream tabs now see the cleaned frame
+    store.add_clean_ops(payload["id"], payload.get("ops", []))
     out = _payload(cleaned, payload.get("filename", "cleaned"), payload["id"])
     out["clean_summary"] = summary
     return out
@@ -174,11 +158,9 @@ def do_clean(payload: dict = Body(...)):
 def do_preprocess(payload: dict = Body(...)):
     """Apply a validated per-column op plan (fit on train only), return a preview
     + change summary. Body: {id, target, task, columns, test_size?, random_state?,
-    stratify?}. Split settings fall back to 80:20 / seed 42. Cleaned CSV
-    stashed for /api/download."""
-    df = STORE.get(payload.get("id"))
-    if df is None:
-        raise HTTPException(404, "Dataset not found (server may have restarted). Re-upload.")
+    stratify?}. Split settings fall back to 80:20 / seed 42. The cleaned CSV and
+    fitted pipeline are saved for /api/download and /api/pipeline."""
+    df = _frame(payload.get("id"))
     if not payload.get("target"):
         raise HTTPException(422, "No target column given.")
     try:
@@ -193,10 +175,8 @@ def do_preprocess(payload: dict = Body(...)):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     fitted = result.pop("fitted")
-    fitted["clean_ops"] = CLEAN_LOG.get(payload["id"], [])
-    CLEANED[payload["id"]] = (result.pop("csv"), fitted)  # keep the big CSV out of the JSON response
-    while len(CLEANED) > STORE_CAP:
-        CLEANED.popitem(last=False)
+    fitted["clean_ops"] = store.clean_ops(payload["id"])
+    store.save_prep(payload["id"], result.pop("csv"), fitted)  # big CSV stays out of the JSON response
     return result
 
 
@@ -221,12 +201,17 @@ def explain(payload: dict = Body(...)):
         raise HTTPException(503, f"AI explanation unavailable ({llm.HINT()}): {exc}") from None
 
 
+def _prep(ds_id):
+    prep = store.load_prep(ds_id)
+    if prep is None:
+        raise HTTPException(404, "No preprocessing run yet. Run preprocessing first.")
+    return prep
+
+
 @app.get("/api/download")
 def download(id: str):
-    if id not in CLEANED:
-        raise HTTPException(404, "No cleaned data yet. Run preprocessing first.")
     return Response(
-        content=CLEANED[id][0],
+        content=_prep(id)["csv"],
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=cleaned.csv"},
     )
@@ -238,9 +223,29 @@ def download_pipeline(id: str):
     TF-IDF. Load with joblib and use execute.transform / execute.to_matrix, same
     scikit-learn version. Only ever load a pipeline file you produced yourself --
     joblib files can run code."""
-    if id not in CLEANED:
-        raise HTTPException(404, "No pipeline yet. Run preprocessing first.")
     buf = io.BytesIO()
-    joblib.dump(CLEANED[id][1], buf)
+    joblib.dump(_prep(id)["fitted"], buf)
     return Response(content=buf.getvalue(), media_type="application/octet-stream",
                     headers={"Content-Disposition": "attachment; filename=pipeline.joblib"})
+
+
+@app.get("/api/runs")
+def list_runs(id: str):
+    return jobs.list_runs(id)
+
+
+@app.get("/api/run")
+def run_status(id: str, run: str):
+    s = jobs.status(id, run)
+    if s is None:
+        raise HTTPException(404, "Run not found.")
+    return s
+
+
+@app.post("/api/run/cancel")
+def cancel_run(payload: dict = Body(...)):
+    """Stops a queued/running run between steps. Body: {id, run}."""
+    try:
+        return {"cancelled": jobs.cancel(payload.get("id"), payload.get("run"))}
+    except KeyError:
+        raise HTTPException(404, "Run not found.") from None

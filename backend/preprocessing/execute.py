@@ -32,7 +32,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
-from profiler import is_numeric
+from profiler import is_numeric, missing_mask
 import advanced
 import clean
 
@@ -185,6 +185,31 @@ def _encode(op, col, fr, st, intlike):
 _DISPATCH = {"impute": _impute, "scale": _scale, "outliers": _outliers, "encode": _encode}
 
 
+def guard_target(df, target, task):
+    """Remove rows the target can't be learned from, and check the target fits
+    the task -- before any split, so preprocessing and training see the same
+    rows. Returns (df, notes). Raises ValueError with a message for the user."""
+    if target not in df.columns:
+        raise ValueError(f"Target '{target}' is not a column in this dataset.")
+    notes = []
+    missing = missing_mask(df[target])  # null OR blank string -- the profiler's rule
+    if missing.any():
+        df = df[~missing]
+        notes.append(f"{int(missing.sum())} row(s) had no {target} value and were removed")
+    if task == "regression" and not is_numeric(df[target]):
+        raise ValueError(f"Regression needs a numeric target column; '{target}' is {df[target].dtype}. "
+                         "Convert it on the Cleaning tab, or choose classification.")
+    if task == "classification":
+        counts = df[target].value_counts()
+        if len(counts) < 2:
+            raise ValueError(f"Classification needs at least 2 classes in '{target}' (found {len(counts)}).")
+        single = [str(v) for v, n in counts.items() if n < 2]
+        if single:
+            notes.append(f"class(es) with a single row: {', '.join(single[:10])} -- the split "
+                         "can't be stratified; merge or remove them")
+    return df, notes
+
+
 def apply_plan(df, target, columns, task="classification", test_size=None,
                random_state=None, pipeline=None, stratify=True):
     """Run a validated per-column op plan, fit on train only. Returns preview,
@@ -198,8 +223,7 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
     random_state = 42 if random_state is None else int(random_state)
     if not 0.05 <= test_size <= 0.5:
         raise ValueError(f"test_size must be between 0.05 and 0.5 (got {test_size}).")
-    if target not in df.columns:
-        raise ValueError(f"Target '{target}' is not a column in this dataset.")
+    df, target_notes = guard_target(df, target, task)
     for _c, ops in columns.items():
         for op in ops:
             _validate(op)
@@ -242,16 +266,6 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
             (pipeline.get("imputation") or {}).get("n_neighbors"))
         pipe_notes.append(_n)
 
-    # remove_rows outliers: drop offending TRAIN rows only (dropping test rows
-    # would distort evaluation). ponytail: IQR bounds, swap for z-score if needed.
-    for c in feats:
-        for o in columns.get(c, []):
-            if o["op"] == "outliers" and o.get("method") == "remove_rows":
-                lo, hi = _iqr_bounds(X_tr[c])
-                num = pd.to_numeric(X_tr[c], errors="coerce")
-                keep = num.between(lo, hi) | num.isna()
-                X_tr, y_tr = X_tr[keep], y_tr[keep]
-
     tr_parts, te_parts, summary = [], [], []
     for c in feats:
         ops = columns.get(c, [])
@@ -265,7 +279,7 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
             if name in ("drop_rows_missing",):
                 continue
             if name == "outliers" and o.get("method") == "remove_rows":
-                applied.append("outliers(remove_rows, train)")
+                applied.append("outliers(remove_rows) - applied during training, inside each fold")
                 continue
             tr, st = _DISPATCH[name](o, c, tr, None, intlike)
             te, _ = _DISPATCH[name](o, c, te, st, intlike)
@@ -284,12 +298,14 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
     te_out = pd.concat(te_parts, axis=1)
 
     # ---- dataset-level pipeline on the assembled numeric matrix (fit on train) ----
+    # Steps that add or drop TRAIN rows (outlier row removal, resampling) are not
+    # written into the export: CV folds must apply them to fold-training rows only,
+    # or copies of scored rows leak into training. Piece 1 reads them from
+    # fitted["settings"]. class_weights changes no rows, so it is still computed.
     class_weights = None
     if advanced._m("outlier_removal", pipeline):
-        tr_out, y_tr, _n = advanced.remove_outliers(
-            tr_out, y_tr, advanced._m("outlier_removal", pipeline),
-            (pipeline.get("outlier_removal") or {}).get("contamination"))
-        pipe_notes.append(_n)
+        pipe_notes.append(f"{advanced._m('outlier_removal', pipeline)} - applied during training, "
+                          "inside each fold (not written to the export)")
     if advanced._m("feature_selection", pipeline):
         k = (pipeline.get("feature_selection") or {}).get("k", 10)
         tr_out, te_out, _n, fitted["keep"] = advanced.select_features(
@@ -299,10 +315,12 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
         n = (pipeline.get("reduction") or {}).get("n", 2)
         tr_out, te_out, _n, fitted["pca"] = advanced.reduce(tr_out, te_out, advanced._m("reduction", pipeline), n)
         pipe_notes.append(_n)
-    if advanced._m("imbalance", pipeline):
-        tr_out, y_tr, _n, class_weights = advanced.balance(
-            tr_out, y_tr, advanced._m("imbalance", pipeline), task)
+    _imb = advanced._m("imbalance", pipeline)
+    if _imb == "class_weights":
+        tr_out, y_tr, _n, class_weights = advanced.balance(tr_out, y_tr, _imb, task)
         pipe_notes.append(_n)
+    elif _imb:
+        pipe_notes.append(f"{_imb} - applied during training, inside each fold (not written to the export)")
 
     tr_out = tr_out.reset_index(drop=True)
     te_out = te_out.reset_index(drop=True)
@@ -323,6 +341,7 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
         "summary": summary,
         "pipeline": pipe_notes,
         "class_weights": class_weights,
+        "notes": target_notes,
         "preview": json.loads(cleaned.head(20).to_json(orient="records")),
         "csv": cleaned.to_csv(index=False),
         "fitted": fitted,
@@ -489,4 +508,36 @@ if __name__ == "__main__":
     assert X_tr.shape[1] == test_out.shape[1] - 1 + n_terms, X_tr.shape  # numbers + every text term
     LogisticRegression(max_iter=500).fit(X_tr, train_out["y"]).predict(to_matrix(fitted, replayed))
     print("saved-pipeline replay self-check passed:", X_tr.shape, [s["ops"] for s in r["summary"]])
+    # target guard: missing targets removed and reported; impossible targets rejected clearly
+    g = pd.DataFrame({"x": range(12), "y": [1.5, None] + [float(i) for i in range(10)]})
+    r = apply_plan(g, "y", {}, task="regression")
+    assert r["train_rows"] + r["test_rows"] == 11, (r["train_rows"], r["test_rows"])
+    assert "1 row(s) had no y value" in r["notes"][0], r["notes"]
+    blank = pd.DataFrame({"x": range(10), "y": ["a", "b", "", "a", "b", "a", "b", "a", "b", "a"]})
+    assert apply_plan(blank, "y", {})["rows_before"] == 9          # blank string counts as missing
+    for bad_df, task, msg in (
+            (pd.DataFrame({"x": range(10), "y": list("abcdefghij")}), "regression", "numeric target"),
+            (pd.DataFrame({"x": range(10), "y": ["a"] * 10}), "classification", "at least 2 classes")):
+        try:
+            apply_plan(bad_df, "y", {}, task=task)
+            raise AssertionError(f"{task} target should have been rejected")
+        except ValueError as e:
+            assert msg in str(e), e
+    one = apply_plan(pd.DataFrame({"x": range(10), "y": ["a"] * 9 + ["b"]}), "y", {})
+    assert any("single row" in n for n in one["notes"]) and not one["stratified"], one["notes"]
+    print("target guard self-check passed")
+
+    # row-changing steps are NOT written into the export; training applies them per fold
+    imb = pd.DataFrame({"x": list(range(60)), "z": [i % 7 for i in range(60)], "y": ["a"] * 50 + ["b"] * 10})
+    imb.loc[5, "x"] = 10_000                                           # an obvious outlier
+    r = apply_plan(imb, "y", {"x": [{"op": "outliers", "method": "remove_rows"}]},
+                   pipeline={"imbalance": {"method": "oversample"},
+                             "outlier_removal": {"method": "isolation_forest"}})
+    assert (r["train_rows"], r["test_rows"]) == (48, 12), (r["train_rows"], r["test_rows"])
+    assert sum("applied during training" in n for n in r["pipeline"]) == 2, r["pipeline"]
+    assert "applied during training" in r["summary"][0]["ops"][0], r["summary"][0]
+    assert r["fitted"]["settings"]["pipeline"]["imbalance"]["method"] == "oversample"
+    cw = apply_plan(imb, "y", {}, pipeline={"imbalance": {"method": "class_weights"}})
+    assert cw["class_weights"] and cw["train_rows"] == 48, cw["class_weights"]
+    print("row-changing steps self-check passed")
     print("split + parameter self-check passed")

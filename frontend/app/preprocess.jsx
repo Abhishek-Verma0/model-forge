@@ -128,7 +128,7 @@ function opCode(step, numeric, col) {
   if (numeric) {
     const k = pval(step, step.outliers, OUTLIER_PARAMS.clip_iqr[0]);
     if (step.outliers === "clip_iqr") lines.push(`${c} = ${c}.clip(lower, upper)  # Q1/Q3 ± ${k}·IQR from train`);
-    if (step.outliers === "remove_rows") lines.push(`train = train[within_iqr("${col}", k=${k})]  # train rows only`);
+    if (step.outliers === "remove_rows") lines.push(`train = train[within_iqr("${col}", k=${k})]  # applied during training, inside each fold`);
     if (step.outliers === "zscore") lines.push(`${c} = ${c}.clip(mean ± ${pval(step, "zscore", OUTLIER_PARAMS.zscore[0])}·std)  # train stats`);
     if (step.outliers === "winsorize") lines.push(`${c} = ${c}.clip(*train.quantile([${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[0])}, ${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[1])}]))`);
     const sc = { standard: "StandardScaler", robust: "RobustScaler", minmax: "MinMaxScaler" }[step.scale];
@@ -153,7 +153,7 @@ function ruleNote(step, numeric) {
   if (f) bits.push(f);
   if (numeric) {
     const o = { clip_iqr: `extreme values capped to ${pval(step, "clip_iqr", OUTLIER_PARAMS.clip_iqr[0])}×IQR bounds`,
-      remove_rows: "extreme training rows removed",
+      remove_rows: "extreme training rows removed during training (inside each fold, not in the export)",
       zscore: `values beyond ${pval(step, "zscore", OUTLIER_PARAMS.zscore[0])} standard deviations capped`,
       winsorize: `capped to the ${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[0])}–${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[1])} quantile range` }[step.outliers];
     if (o) bits.push(o);
@@ -393,7 +393,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                      onChange={(e) => setPipe("knn_n", e.target.value)} />
             </label>
           )}
-          <label className="pp-field"><span>Outlier removal</span>
+          <label className="pp-field"><span>Outlier removal (applied during training)</span>
             <select value={pipeline.outlier_removal} onChange={(e) => setPipe("outlier_removal", e.target.value)}>
               {OUTREM_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
@@ -415,7 +415,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                      onChange={(e) => setPipe("fs_k", e.target.value)} style={{ width: 70 }} />
             </label>
           )}
-          <label className="pp-field"><span>Imbalance{task !== "classification" ? " (clf only)" : ""}</span>
+          <label className="pp-field"><span>Imbalance{task !== "classification" ? " (clf only)" : " (applied during training)"}</span>
             <select value={pipeline.imbalance} disabled={task !== "classification"}
                     onChange={(e) => setPipe("imbalance", e.target.value)}>
               {IMB_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
@@ -527,6 +527,12 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
             seed {result.random_state}
             {result.dropped_columns.length > 0 && ` · dropped: ${result.dropped_columns.join(", ")}`}
           </div>
+
+          {result.notes?.length > 0 && (
+            <div className="pp-ai" style={{ marginBottom: 10 }}>
+              {result.notes.map((n, i) => <p key={i} style={{ margin: 0 }}>{n}</p>)}
+            </div>
+          )}
 
           <details className="pp-summary" open>
             <summary>What changed, per column</summary>

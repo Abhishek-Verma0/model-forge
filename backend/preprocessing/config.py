@@ -76,6 +76,10 @@ def provider_chain():
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 200))
 
+# Where uploaded datasets, fitted pipelines and training runs are saved. A
+# deployment setting (disk location), not an analysis one.
+DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent.parent / "data"))
+
 
 def dataset_path():
     """The dataset to work on: CLI argument first, then $DATASET_PATH."""
