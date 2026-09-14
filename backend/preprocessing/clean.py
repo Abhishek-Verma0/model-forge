@@ -18,7 +18,7 @@ drop_duplicates which is dataset-level:
 
 import pandas as pd
 
-from profiler import is_numeric
+from preprocessing.profiler import is_numeric
 
 _CLEAN_OPS = {"trim_whitespace", "merge_categories", "retype", "map_values", "nullify",
               "rename_column", "drop_column", "drop_duplicates"}

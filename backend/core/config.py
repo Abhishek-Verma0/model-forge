@@ -36,6 +36,12 @@ LLM_FALLBACK = os.getenv("LLM_FALLBACK", "").strip().lower() in ("1", "true", "y
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")  # match the model actually pulled in Ollama
+# Tokens Ollama may read per request. Without it Ollama used 4,096 and silently dropped the
+# START of longer prompts (measured 2026-09-15: a 12,326-token AI plan was read as 2,050).
+# 16384 = our starting point, measured on an RTX 5070 Laptop (8 GB): fits the largest measured
+# AI plan; the model writes ~2x slower than at 4,096 (28 vs 57 tokens/s) as part of it moves to
+# the CPU. Longer requests now fail with a clear error instead of being cut.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", 16384))
 
 HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 HF_URL = os.getenv("HF_URL", "https://router.huggingface.co/v1/chat/completions")
@@ -75,6 +81,13 @@ def provider_chain():
 
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 200))
+# Datasets kept in memory at once (the disk copy is the source of truth). Our starting
+# point: 5; lower it on a machine with little RAM, raise it to switch datasets faster.
+STORE_CAP = int(os.getenv("STORE_CAP", 5))
+
+# Where uploaded datasets, fitted pipelines and training runs are saved. A
+# deployment setting (disk location), not an analysis one.
+DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent.parent / "data"))
 
 
 def dataset_path():

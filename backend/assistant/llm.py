@@ -1,12 +1,12 @@
 import json
+import re
 
 import requests
 
-import config
-from config import OLLAMA_MODEL, OLLAMA_URL, LLM_TIMEOUT
-import clean as _clean
-import execute as _execute
-import advanced as _advanced
+from assistant import results as _results
+from core import config
+from core.config import OLLAMA_MODEL, OLLAMA_URL, LLM_TIMEOUT
+from preprocessing import advanced as _advanced, clean as _clean, execute as _execute
 
 
 # Ollama's chat endpoint (multi-turn), derived from the generate URL.
@@ -41,27 +41,76 @@ def _first_working(call):
     raise RuntimeError("; ".join(failures) or "no LLM backend configured")
 
 
-def _complete_one(provider, prompt, json_mode):
+class PromptTooLong(RuntimeError):
+    """Ollama refused a request larger than its context window (we send truncate=false),
+    instead of silently dropping the start of the prompt."""
+
+    def __init__(self, tokens, limit):
+        super().__init__(f"AI request too long: {tokens} tokens, limit {limit} "
+                         f"(raise OLLAMA_NUM_CTX in backend/.env or send less)")
+        self.tokens, self.limit = tokens, limit
+
+
+def _ollama_post(url, body, **kwargs):
+    """POST to Ollama with our context size and truncation off (verified on Ollama
+    0.32.15: an oversized request then returns HTTP 400 exceed_context_size_error)."""
+    body = {**body, "truncate": False, "options": {"num_ctx": config.OLLAMA_NUM_CTX, **body.get("options", {})}}
+    r = requests.post(url, json=body, timeout=LLM_TIMEOUT, **kwargs)
+    if r.status_code == 400 and "exceed" in r.text:
+        found = re.search(r"request \((\d+) tokens\)", r.text)
+        raise PromptTooLong(int(found.group(1)) if found else None, config.OLLAMA_NUM_CTX)
+    r.raise_for_status()
+    return r
+
+
+def _complete_one(provider, prompt, json_mode, temperature=None):
     if provider == "ollama":
         body = {"model": config.OLLAMA_MODEL, "prompt": prompt, "stream": False, "think": False}
         if json_mode:
             body["format"] = "json"
-        r = requests.post(config.OLLAMA_URL, json=body, timeout=LLM_TIMEOUT)
-        r.raise_for_status()
-        return r.json()["response"]
+        if temperature is not None:
+            body["options"] = {"temperature": temperature}
+        return _ollama_post(config.OLLAMA_URL, body).json()["response"]
 
     url, key, model = _openai_target(provider)
     body = {"model": model, "stream": False, "messages": [{"role": "user", "content": prompt}]}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
+    if temperature is not None:
+        body["temperature"] = temperature
     r = requests.post(url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=LLM_TIMEOUT)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-def _complete(prompt, json_mode=False):
+def _complete(prompt, json_mode=False, temperature=None):
     """One-shot prompt -> text, from the first backend in the chain that answers."""
-    return _first_working(lambda p: _complete_one(p, prompt, json_mode))
+    return _first_working(lambda p: _complete_one(p, prompt, json_mode, temperature))
+
+
+def identity():
+    """Which AI would answer -- part of the suggestion cache key, so switching
+    provider or model never reuses another model's suggestions."""
+    names = {"ollama": config.OLLAMA_MODEL, "huggingface": config.HF_MODEL, "gemini": config.GEMINI_MODEL}
+    return "|".join(f"{p}:{names[p]}" for p in config.provider_chain())
+
+
+def suggest_models(context):
+    """Ask the AI to rank models for this dataset. It sees measured facts and the
+    list of models that can train on the data -- never data rows -- and may only
+    pick from that list (training/suggest.py validates). Temperature 0 makes
+    answers steadier; the cache is what makes them repeatable."""
+    prompt = f"""You help a researcher choose machine-learning models for a tabular dataset.
+Pick up to {context["max"]} models from the ALLOWED list that are most likely to do well on this data,
+best first, each with one short reason tied to the facts below. Use only keys from the ALLOWED list.
+Reply with ONLY JSON: {{"models": [{{"key": "<allowed key>", "reason": "<one sentence>"}}]}}
+
+Dataset facts (measured on the preprocessed training rows):
+{json.dumps(context["facts"], indent=1)}
+
+ALLOWED models:
+{json.dumps(context["models"], indent=1)}"""
+    return _extract_json(_complete(prompt, json_mode=True, temperature=0))
 
 
 def _parse_chunk(line):
@@ -90,9 +139,17 @@ def _parse_chunk(line):
 
 def _stream_one(provider, messages):
     if provider == "ollama":
-        resp = requests.post(OLLAMA_CHAT_URL, stream=True, timeout=LLM_TIMEOUT,
-                             json={"model": config.OLLAMA_MODEL, "messages": messages,
-                                   "stream": True, "think": False})
+        msgs = list(messages)
+        while True:
+            try:
+                return _ollama_post(OLLAMA_CHAT_URL, {"model": config.OLLAMA_MODEL, "messages": msgs,
+                                                      "stream": True, "think": False}, stream=True)
+            except PromptTooLong:
+                # A long conversation drops its OLDEST turns -- never the system message
+                # (rules + facts) and never the newest question.
+                if len(msgs) <= 2:
+                    raise
+                del msgs[1]
     else:
         url, key, model = _openai_target(provider)
         resp = requests.post(url, headers={"Authorization": f"Bearer {key}"},
@@ -293,29 +350,65 @@ def chat_stream(messages, context):
     UI can render the reply as it arrives.
 
     `messages` = [{role, content}] history; `context` = the recommended plan
-    ({target, task, columns:[{name,type,missing_percent,action}]}) -- aggregated
-    metadata only, never raw rows. Returns a generator of text chunks; the initial
-    connection is made here so a dead Ollama raises before streaming starts."""
-    system = f"""You are a friendly data-preprocessing assistant for NON-TECHNICAL users.
-The user is preparing a dataset to predict "{context.get('target')}" ({context.get('task')}).
-Here is the recommended plan -- each column with its type, how much is missing, and the action:
+    ({target, task, rows, columns:[{name,type,missing_percent,action}], dataset_facts}) --
+    aggregated metadata only, never raw rows. `dataset_facts` = measured profile facts
+    for every column (type, unique values, missing %, constant, ID-like, top values
+    or statistics). `results_view` (optional) = the part of the training run on the page
+    this question needs (assistant/results.py). Returns a generator of text chunks; the
+    initial connection is made here so a dead Ollama raises before streaming starts.
+    When the reply ends, any number in it that was not in what the AI was sent is
+    listed in a final "Not verified" line."""
+    results_view = context.get("results_view")
+    results_part = "" if not results_view else f"""
 
+Training results currently on the page (numbers computed by the app):
+{json.dumps(results_view, indent=1, default=str)}
+
+When asked about models or results, use ONLY these numbers and name the metric you use.
+"train" = score on the model's own training rows; "cv_mean"/"cv_sd" = average and spread over held-out
+folds; "test" = the locked test set, never used to choose the model. Train far better than CV means the
+model memorised its rows (overfitting); CV close to test means the score holds on unseen rows. "Best" means
+the best CV mean on the main metric -- not proof it is best in real use. A number you need that is not
+listed is "not available" -- say so. Say clearly when advice on what to try next is only a suggestion."""
+    system = f"""You are an honest assistant for NON-TECHNICAL users, helping with data preprocessing and training results.
+
+Dataset: {context.get('rows')} rows. Measured facts for every column (no data rows are shared):
+{json.dumps(context.get('dataset_facts'), indent=1, default=str)}
+
+The user's CURRENT selection is "{context.get('target')}" as the column to predict ({context.get('task')}).
+That is only their current choice -- it may be a mistake. Do not defend it because it is selected.
+
+Judging a target (use the facts above and what the column names mean):
+- Unusable: constant, looks like an ID, almost unique per row (free text), mostly missing,
+  or a class with too few rows to learn from.
+- Usable but not natural: a column that describes the rows rather than an outcome people
+  usually want to know, when another column in the table looks like that outcome.
+  Say which column looks like the more natural target and why, but add that the right target
+  depends on the user's goal, which only they know.
+- Give the same answer to "which column should I predict?" whatever is currently selected.
+
+Recommended plan for the current selection -- each feature column with its type, missing %, and action:
 {json.dumps(context.get('columns', []), indent=2)}
 
-Answer their questions about WHY and WHICH preprocessing to do, in plain, short language
-(no jargon dumps). Never invent data not in the plan. If asked something unrelated, gently
-steer back to preprocessing."""
+Answer in plain, short language (no jargon dumps). Never invent data not in the facts, the plan
+or the results. If asked something unrelated, gently steer back to preprocessing and training.{results_part}"""
 
     payload = [{"role": "system", "content": system}] + list(messages)
     resp = _open_stream(payload)
 
     def gen():
+        answer = ""
         for line in resp.iter_lines():
             piece, done = _parse_chunk(line)
             if piece:
+                answer += piece
                 yield piece
             if done:
                 break
+        missing = _results.unverified(answer, payload)
+        if missing:
+            yield ("\n\n⚠️ Not verified: " + ", ".join(missing) +
+                   " — not found in the data the AI was given. Check these before trusting them.")
 
     return gen()
 
@@ -349,4 +442,45 @@ if __name__ == "__main__":
         assert all(p in str(e) for p in seen), e          # every failure named
     assert _first_working(lambda p: f"ok:{p}") == f"ok:{config.provider_chain()[0]}"
     assert isinstance(HINT(), str) and HINT()
+
+    # context window: our size + truncation off on every Ollama request; an oversized
+    # request is a clear error, and a long chat drops its oldest turns only
+    class _Resp:
+        def __init__(self, status, text):
+            self.status_code, self.text = status, text
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "ok"}
+
+    sent = []
+
+    def fake_post(url, json=None, **kw):
+        sent.append(json)
+        size = len(json.get("messages") or [json.get("prompt")])
+        if size > 3:  # pretend anything over 3 messages exceeds the window
+            return _Resp(400, '{"error":{"message":"request (9999 tokens) exceeds the available context size",'
+                              '"type":"exceed_context_size_error"}}')
+        return _Resp(200, "")
+
+    real_post, requests.post = requests.post, fake_post
+    try:
+        assert _complete_one("ollama", "short", False) == "ok"
+        assert sent[-1]["truncate"] is False and sent[-1]["options"]["num_ctx"] == config.OLLAMA_NUM_CTX, sent[-1]
+        assert _complete_one("ollama", "t", False, temperature=0) == "ok"
+        assert sent[-1]["options"] == {"num_ctx": config.OLLAMA_NUM_CTX, "temperature": 0}, sent[-1]
+        history = [{"role": "system", "content": "rules"}] + [{"role": "user", "content": f"q{i}"} for i in range(6)]
+        _stream_one("ollama", history)
+        kept = sent[-1]["messages"]
+        assert kept[0]["content"] == "rules" and kept[-1]["content"] == "q5" and len(kept) == 3, kept
+        requests.post = lambda url, json=None, **kw: _Resp(400, '{"error":"request (9999 tokens) exceeds ..."}')
+        try:
+            _complete_one("ollama", "huge", False)
+            raise AssertionError("an oversized prompt must raise, not be cut")
+        except PromptTooLong as e:
+            assert e.tokens == 9999 and "OLLAMA_NUM_CTX" in str(e), e
+    finally:
+        requests.post = real_post
     print(f"llm self-check passed (chain={config.provider_chain()}, both stream formats parse)")

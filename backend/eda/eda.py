@@ -15,10 +15,11 @@ matplotlib.use("Agg")            # headless backend -- REQUIRED off the main thr
 import matplotlib.pyplot as plt  # noqa: E402
 import seaborn as sns            # noqa: E402
 
-from profiler import is_numeric  # noqa: E402
+from preprocessing.profiler import is_numeric  # noqa: E402
 
 sns.set_theme(style="whitegrid")
 
+# Chart caps -- all our starting points (display limits, they never change the data):
 MAX_NUMERIC = 8       # cap per-column charts so a wide dataset doesn't render 100 images
 MAX_MISSMAP_COLS = 40 # missing-value map gets unreadable past this many columns
 MAX_PAIRPLOT = 5      # pairplot is O(k^2) panels

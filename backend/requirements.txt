@@ -1,13 +1,31 @@
-pandas
-openpyxl
-requests
-fastapi
-uvicorn[standard]
-python-multipart
+# Exact versions verified together on 2026-09-13. A saved pipeline or model
+# only loads reliably with the same scikit-learn -- change pins deliberately.
 
-matplotlib
-seaborn
-scikit-learn
-imbalanced-learn
-torch
-torchvision
+# API
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+python-dotenv==1.2.3
+requests==2.34.2
+
+# Data
+pandas==3.0.5
+numpy==2.5.3
+scipy==1.18.1
+openpyxl==3.1.5
+joblib==1.6.0
+
+# Charts
+matplotlib==3.11.1
+seaborn==0.13.2
+
+# ML
+scikit-learn==1.9.0
+imbalanced-learn==0.14.2
+xgboost==3.4.1
+lightgbm==4.7.0
+catboost==1.2.10
+
+# Optional, not installed: pretrained fine-tuning (spec piece 6)
+# torch
+# torchvision
