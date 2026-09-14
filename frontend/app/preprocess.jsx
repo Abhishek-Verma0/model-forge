@@ -2,36 +2,29 @@
 
 import { useEffect, useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API } from "./apiclient";
 
 // Each control maps to ONE separable operation. Scaling defaults to "none" --
 // median-impute must not silently scale a column (that was the 0.5/0.6 bug).
-const MISSING_OPTS = ["none", "median", "mean", "most_frequent", "constant", "drop_rows", "drop_column"];
-const SCALE_OPTS = ["none", "standard", "robust", "minmax"];
-const OUTLIER_OPTS = ["none", "clip_iqr", "zscore", "winsorize", "remove_rows"];
-const ENCODE_OPTS = ["none", "onehot", "ordinal", "text", "drop"];
+//
+// Every choice list and default (`opts`) comes from the backend:
+// data.preprocess_options, built by preprocessing/execute.py options(). This file
+// only decides how they are shown -- no second copy of any number to drift.
 
-// Tunable parameters per outlier method. These change the DATA, so they ride on
-// the op (not a server setting) and land in the run summary -- same seed + same
-// parameters must reproduce the same result.
+// How each outlier method's parameters are shown (label, input step, bounds). These
+// change the DATA, so they ride on the op and land in the run summary; their
+// defaults come from the backend (opts.outlier_defaults).
 const OUTLIER_PARAMS = {
-  clip_iqr:    [{ key: "k", label: "IQR k", def: 1.5, step: 0.1, min: 0.1 }],
-  remove_rows: [{ key: "k", label: "IQR k", def: 1.5, step: 0.1, min: 0.1 }],
-  zscore:      [{ key: "threshold", label: "sd", def: 3, step: 0.5, min: 0.1 }],
-  winsorize:   [{ key: "lower", label: "low q", def: 0.05, step: 0.01, min: 0, max: 0.49 },
-                { key: "upper", label: "high q", def: 0.95, step: 0.01, min: 0.51, max: 1 }],
+  clip_iqr:    [{ key: "k", label: "IQR k", step: 0.1, min: 0.1 }],
+  remove_rows: [{ key: "k", label: "IQR k", step: 0.1, min: 0.1 }],
+  zscore:      [{ key: "threshold", label: "sd", step: 0.5, min: 0.1 }],
+  winsorize:   [{ key: "lower", label: "low q", step: 0.01, min: 0, max: 0.49 },
+                { key: "upper", label: "high q", step: 0.01, min: 0.51, max: 1 }],
 };
-const pval = (step, method, p) => step.params?.[method]?.[p.key] ?? p.def;
-const IMPUTE = ["median", "mean", "most_frequent", "constant"];
-const MAX_ONEHOT = 50;
-
-// Dataset-level steps (fit on train, applied by advanced.py). Separate from the
-// per-column ops -- these act on the whole numeric matrix / the train rows.
-const ADV_IMPUTE_OPTS = ["none", "knn", "iterative"];
-const OUTREM_OPTS = ["none", "isolation_forest"];
-const FS_OPTS = ["none", "correlation", "chi2", "anova", "mutual_info", "rfe"];
-const IMB_OPTS = ["none", "oversample", "undersample", "smote", "class_weights"];
-const RED_OPTS = ["none", "pca"];
+// `method` can be "none" (opCode reads the IQR k before checking the method), so a
+// method without defaults yields undefined -- callers only use the value for its own method.
+const pval = (opts, step, method, p) => step.params?.[method]?.[p.key] ?? opts.outlier_defaults[method]?.[p.key];
+const NOT_IMPUTE = ["none", "drop_rows", "drop_column"]; // "missing" choices that are not an impute strategy
 const SPLIT_OPTS = [
   { v: 0.3, label: "70 : 30" },
   { v: 0.25, label: "75 : 25" },
@@ -66,7 +59,7 @@ export function defaultSteps(data, target) {
       // text blanks stay blank -- the text encoder handles them; a filled-in review is fake
       if (miss > 0 && !text) step.missing = numeric ? "median" : "most_frequent";
       if (!numeric) step.encode = idCols.has(col) ? "drop" : text ? "text"
-        : info[col].unique_values > MAX_ONEHOT ? "drop" : "onehot";
+        : info[col].unique_values > data.preprocess_options.max_onehot ? "drop" : "onehot";
     }
     steps[col] = step;
   }
@@ -74,15 +67,15 @@ export function defaultSteps(data, target) {
 }
 
 // One column's controls -> the ordered op list the backend executes.
-function toOps(step, numeric) {
+function toOps(opts, step, numeric) {
   if (step.missing === "drop_column" || step.encode === "drop") return [{ op: "drop_column" }];
   const ops = [];
-  if (IMPUTE.includes(step.missing)) ops.push({ op: "impute", strategy: step.missing });
+  if (!NOT_IMPUTE.includes(step.missing)) ops.push({ op: "impute", strategy: step.missing });
   else if (step.missing === "drop_rows") ops.push({ op: "drop_rows_missing" });
   if (numeric) {
     if (step.outliers !== "none") {
       const op = { op: "outliers", method: step.outliers };
-      for (const p of OUTLIER_PARAMS[step.outliers] || []) op[p.key] = Number(pval(step, step.outliers, p));
+      for (const p of OUTLIER_PARAMS[step.outliers] || []) op[p.key] = Number(pval(opts, step, step.outliers, p));
       ops.push(op);
     }
     if (step.scale !== "none") ops.push({ op: "scale", method: step.scale });
@@ -115,7 +108,7 @@ function stepFromOps(ops, numeric) {
 
 // The actual pandas each op runs as -- shown so the user sees exactly what
 // happens before hitting Run (requirement: "proposed operations/code").
-function opCode(step, numeric, col) {
+function opCode(opts, step, numeric, col) {
   if (step.missing === "drop_column" || step.encode === "drop") return [`df = df.drop(columns=["${col}"])`];
   const c = `df["${col}"]`;
   const lines = [];
@@ -126,11 +119,11 @@ function opCode(step, numeric, col) {
   if (fills[step.missing]) lines.push(`${c} = ${c}.fillna(${fills[step.missing]})  # train-fitted`);
   else if (step.missing === "drop_rows") lines.push(`df = df.dropna(subset=["${col}"])`);
   if (numeric) {
-    const k = pval(step, step.outliers, OUTLIER_PARAMS.clip_iqr[0]);
+    const k = pval(opts, step, step.outliers, OUTLIER_PARAMS.clip_iqr[0]);
     if (step.outliers === "clip_iqr") lines.push(`${c} = ${c}.clip(lower, upper)  # Q1/Q3 ± ${k}·IQR from train`);
     if (step.outliers === "remove_rows") lines.push(`train = train[within_iqr("${col}", k=${k})]  # applied during training, inside each fold`);
-    if (step.outliers === "zscore") lines.push(`${c} = ${c}.clip(mean ± ${pval(step, "zscore", OUTLIER_PARAMS.zscore[0])}·std)  # train stats`);
-    if (step.outliers === "winsorize") lines.push(`${c} = ${c}.clip(*train.quantile([${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[0])}, ${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[1])}]))`);
+    if (step.outliers === "zscore") lines.push(`${c} = ${c}.clip(mean ± ${pval(opts, step, "zscore", OUTLIER_PARAMS.zscore[0])}·std)  # train stats`);
+    if (step.outliers === "winsorize") lines.push(`${c} = ${c}.clip(*train.quantile([${pval(opts, step, "winsorize", OUTLIER_PARAMS.winsorize[0])}, ${pval(opts, step, "winsorize", OUTLIER_PARAMS.winsorize[1])}]))`);
     const sc = { standard: "StandardScaler", robust: "RobustScaler", minmax: "MinMaxScaler" }[step.scale];
     if (sc) lines.push(`${c} = ${sc}().fit(train[["${col}"]]).transform(...)`);
   } else {
@@ -143,7 +136,7 @@ function opCode(step, numeric, col) {
   return lines.length ? lines : [`# ${col}: kept as-is`];
 }
 
-function ruleNote(step, numeric) {
+function ruleNote(opts, step, numeric) {
   if (step.missing === "drop_column") return "Mostly empty or free-text/ID — dropped.";
   if (step.encode === "drop") return "Too many unique values to encode — dropped.";
   const bits = [];
@@ -152,11 +145,11 @@ function ruleNote(step, numeric) {
     drop_rows: "rows with gaps removed" }[step.missing];
   if (f) bits.push(f);
   if (numeric) {
-    const o = { clip_iqr: `extreme values capped to ${pval(step, "clip_iqr", OUTLIER_PARAMS.clip_iqr[0])}×IQR bounds`,
+    const out = { clip_iqr: `extreme values capped to ${pval(opts, step, "clip_iqr", OUTLIER_PARAMS.clip_iqr[0])}×IQR bounds`,
       remove_rows: "extreme training rows removed during training (inside each fold, not in the export)",
-      zscore: `values beyond ${pval(step, "zscore", OUTLIER_PARAMS.zscore[0])} standard deviations capped`,
-      winsorize: `capped to the ${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[0])}–${pval(step, "winsorize", OUTLIER_PARAMS.winsorize[1])} quantile range` }[step.outliers];
-    if (o) bits.push(o);
+      zscore: `values beyond ${pval(opts, step, "zscore", OUTLIER_PARAMS.zscore[0])} standard deviations capped`,
+      winsorize: `capped to the ${pval(opts, step, "winsorize", OUTLIER_PARAMS.winsorize[0])}–${pval(opts, step, "winsorize", OUTLIER_PARAMS.winsorize[1])} quantile range` }[step.outliers];
+    if (out) bits.push(out);
     const s = { robust: "scaled by median/IQR (outlier-safe)", standard: "standardized", minmax: "squeezed to 0–1" }[step.scale];
     if (s) bits.push(s);
   } else {
@@ -169,8 +162,8 @@ function ruleNote(step, numeric) {
   return s.charAt(0).toUpperCase() + s.slice(1) + ".";
 }
 
-function actionText(step, numeric) {
-  const ops = toOps(step, numeric);
+function actionText(opts, step, numeric) {
+  const ops = toOps(opts, step, numeric);
   if (!ops.length) return "keep as-is";
   return ops.map((o) => o.op === "impute" ? `impute(${o.strategy})`
     : o.op === "scale" ? `scale(${o.method})`
@@ -180,17 +173,17 @@ function actionText(step, numeric) {
 }
 
 // Plan summary for the AI chat context (aggregated metadata only, never raw rows).
-function planSummary(steps, semType, missPct, target, task) {
+function planSummary(opts, steps, semType, missPct, target, task) {
   const columns = Object.entries(steps).map(([name, step]) => ({
     name, type: semType[name], missing_percent: missPct[name] || 0,
-    action: actionText(step, semType[name] === "numeric"),
+    action: actionText(opts, step, semType[name] === "numeric"),
   }));
   return { target, task, columns };
 }
 
 export function recommendedPlan(data, target, task) {
   const { semType, missPct } = meta(data, target);
-  return planSummary(defaultSteps(data, target), semType, missPct, target, task);
+  return planSummary(data.preprocess_options, defaultSteps(data, target), semType, missPct, target, task);
 }
 
 const sameStep = (a, b) =>
@@ -198,32 +191,34 @@ const sameStep = (a, b) =>
   JSON.stringify(a.params || {}) === JSON.stringify(b.params || {});
 
 // AI's dataset-level pipeline -> our flat control state (missing sections = "none").
-function pipelineFromAI(p) {
+function pipelineFromAI(opts, p) {
+  const d = opts.pipeline_defaults;
   return {
     imputation: p.imputation?.method || "none",
-    knn_n: p.imputation?.n_neighbors || 5,
+    knn_n: p.imputation?.n_neighbors || d.knn_n,
     outlier_removal: p.outlier_removal?.method || "none",
-    contamination: p.outlier_removal?.contamination || 0.05,
+    contamination: p.outlier_removal?.contamination || d.contamination,
     feature_selection: p.feature_selection?.method || "none",
-    fs_k: p.feature_selection?.k || 10,
+    fs_k: p.feature_selection?.k || d.fs_k,
     imbalance: p.imbalance?.method || "none",
     reduction: p.reduction?.method || "none",
-    red_n: p.reduction?.n || 2,
+    red_n: p.reduction?.n || d.red_n,
   };
 }
 
-export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan }) {
+export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan, onDone }) {
   const { info, semType, missPct, feats } = meta(data, target);
+  const opts = data.preprocess_options;
   const [steps, setSteps] = useState(() => defaultSteps(data, target));
   // Train/test split -- plan §10 wants these user-chosen, and a recorded seed is
-  // what makes a run reproducible. Defaults mirror the backend config.
-  const [split, setSplit] = useState({ test_size: 0.2, random_state: 42, stratify: true });
+  // what makes a run reproducible. Defaults come from the backend.
+  const [split, setSplit] = useState({ test_size: opts.split.test_size, random_state: opts.split.random_state,
+                                       stratify: opts.split.stratify });
   const setSp = (k, v) => setSplit((s) => ({ ...s, [k]: v }));
 
   const [pipeline, setPipeline] = useState({
-    imputation: "none", knn_n: 5, outlier_removal: "none", contamination: 0.05,
-    feature_selection: "none", fs_k: 10,
-    imbalance: "none", reduction: "none", red_n: 2,
+    imputation: "none", outlier_removal: "none", feature_selection: "none", imbalance: "none", reduction: "none",
+    ...opts.pipeline_defaults,
   });
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -232,7 +227,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   // Lift a summary of the live plan up so the AI chat remembers the user's
   // actual decisions (not just the rule defaults).
   useEffect(() => {
-    onPlan?.(planSummary(steps, semType, missPct, target, task));
+    onPlan?.(planSummary(opts, steps, semType, missPct, target, task));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [steps, target]);
 
@@ -272,7 +267,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
       for (const col of feats) if (aiSteps[col]) next[col] = aiSteps[col];
       return next;
     });
-    if (hasAiPipeline) setPipeline(pipelineFromAI(aiPipeline)); // also adopt the AI's dataset-level steps
+    if (hasAiPipeline) setPipeline(pipelineFromAI(opts, aiPipeline)); // also adopt the AI's dataset-level steps
     onApplyAI?.();
   }
 
@@ -299,7 +294,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   async function apply() {
     setLoading(true); setError(""); setResult(null);
     const columns = {};
-    for (const col of feats) columns[col] = toOps(steps[col], semType[col] === "numeric");
+    for (const col of feats) columns[col] = toOps(opts, steps[col], semType[col] === "numeric");
     try {
       const res = await fetch(`${API}/api/preprocess`, {
         method: "POST",
@@ -316,6 +311,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         throw new Error(d);
       }
       setResult(await res.json());
+      onDone?.();
     } catch (e) {
       setError(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
     } finally { setLoading(false); }
@@ -360,7 +356,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         <div className="builder-row">
           <label className="pp-field"><span>Split</span>
             <select value={split.test_size} onChange={(e) => setSp("test_size", e.target.value)}>
-              {SPLIT_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+              {SPLIT_OPTS.filter((x) => x.v >= opts.split.test_size_min && x.v <= opts.split.test_size_max).map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
             </select>
           </label>
           <label className="pp-field"><span>Random seed</span>
@@ -384,7 +380,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         <div className="builder-row">
           <label className="pp-field"><span>Advanced imputation</span>
             <select value={pipeline.imputation} onChange={(e) => setPipe("imputation", e.target.value)}>
-              {ADV_IMPUTE_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+              {opts.pipeline.imputation.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
           {pipeline.imputation === "knn" && (
@@ -395,7 +391,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           )}
           <label className="pp-field"><span>Outlier removal (applied during training)</span>
             <select value={pipeline.outlier_removal} onChange={(e) => setPipe("outlier_removal", e.target.value)}>
-              {OUTREM_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+              {opts.pipeline.outlier_removal.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
           {pipeline.outlier_removal !== "none" && (
@@ -406,7 +402,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           )}
           <label className="pp-field"><span>Feature selection</span>
             <select value={pipeline.feature_selection} onChange={(e) => setPipe("feature_selection", e.target.value)}>
-              {FS_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+              {opts.pipeline.feature_selection.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
           {pipeline.feature_selection !== "none" && (
@@ -418,12 +414,12 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           <label className="pp-field"><span>Imbalance{task !== "classification" ? " (clf only)" : " (applied during training)"}</span>
             <select value={pipeline.imbalance} disabled={task !== "classification"}
                     onChange={(e) => setPipe("imbalance", e.target.value)}>
-              {IMB_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+              {opts.pipeline.imbalance.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
           <label className="pp-field"><span>Reduction</span>
             <select value={pipeline.reduction} onChange={(e) => setPipe("reduction", e.target.value)}>
-              {RED_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+              {opts.pipeline.reduction.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
           {pipeline.reduction !== "none" && (
@@ -466,7 +462,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                 <label className="pp-field">
                   <span>Missing ({missPct[col]}%)</span>
                   <select value={step.missing} onChange={(e) => setStep(col, "missing", e.target.value)}>
-                    {MISSING_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+                    {opts.missing.map((o) => <option key={o} value={o}>{o}</option>)}
                   </select>
                 </label>
               )}
@@ -476,7 +472,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                   <label className="pp-field">
                     <span>Outliers</span>
                     <select value={step.outliers} onChange={(e) => setStep(col, "outliers", e.target.value)}>
-                      {OUTLIER_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+                      {opts.outliers.map((o) => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </label>
                   {/* Parameters appear only for the method actually chosen, pre-filled
@@ -485,14 +481,14 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                     <label className="pp-field" key={p.key} style={{ maxWidth: 92 }}>
                       <span>{p.label}</span>
                       <input type="number" step={p.step} min={p.min} max={p.max}
-                             value={pval(step, step.outliers, p)}
+                             value={pval(opts, step, step.outliers, p)}
                              onChange={(e) => setParam(col, step.outliers, p.key, e.target.value)} />
                     </label>
                   ))}
                   <label className="pp-field">
                     <span>Scale</span>
                     <select value={step.scale} onChange={(e) => setStep(col, "scale", e.target.value)}>
-                      {SCALE_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+                      {opts.scale.map((o) => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </label>
                 </>
@@ -501,14 +497,14 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                   <label className="pp-field">
                     <span>Encode</span>
                     <select value={step.encode} onChange={(e) => setStep(col, "encode", e.target.value)}>
-                      {ENCODE_OPTS.map((o) => <option key={o} value={o}>{o}</option>)}
+                      {opts.encode.map((o) => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </label>
                 </>
               )}
 
-              <pre className="pp-code">{opCode(step, numeric, col).join("\n")}</pre>
-              <p className="pp-reason">{aiNotes[col] || ruleNote(step, numeric)}</p>
+              <pre className="pp-code">{opCode(opts, step, numeric, col).join("\n")}</pre>
+              <p className="pp-reason">{aiNotes[col] || ruleNote(opts, step, numeric)}</p>
             </div>
           );
         })}

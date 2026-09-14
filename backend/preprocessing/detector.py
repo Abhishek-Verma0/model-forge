@@ -2,22 +2,22 @@ import warnings
 
 import pandas as pd
 
-from profiler import is_numeric, empty_string_mask
+from preprocessing.profiler import is_numeric, empty_string_mask
 
 # Detection thresholds. Deliberately NOT user-tunable: a researcher overrides the
 # VERDICT (untick the suggested drop on the Cleaning tab), not the dial -- "is
 # patient_code an ID?" is a judgement call, 0.95 is not a number they can reason about.
-IQR_MULTIPLIER = 1.5
-CATEGORICAL_THRESHOLD = 0.5
-MAX_CATEGORICAL_UNIQUE = 50
-ID_RATIO_THRESHOLD = 0.95
-CARDINALITY_THRESHOLD = 0.5
-CARDINALITY_MIN_UNIQUE = 20
+IQR_MULTIPLIER = 1.5          # published default: Tukey's fences, Q1/Q3 -/+ 1.5 x IQR
+CATEGORICAL_THRESHOLD = 0.5   # our starting point: categorical needs distinct/rows at or below this...
+MAX_CATEGORICAL_UNIQUE = 50   # our starting point: ...and at most this many distinct values (also the one-hot limit)
+ID_RATIO_THRESHOLD = 0.95     # our starting point: distinct/rows share at which a column looks like an ID
+CARDINALITY_THRESHOLD = 0.5   # our starting point: distinct/rows share flagged as high cardinality
+CARDINALITY_MIN_UNIQUE = 20   # our starting point: ...and at least this many distinct values
 # Free text = most values distinct AND a typical cell holds several words
-# (AutoGluon's rule). Other many-valued strings -- cities, CPU models, codes -- are
-# "string": short fragments that repeat across rows.
-FREETEXT_MIN_UNIQUE = 0.5
-FREETEXT_MIN_WORDS = 3  # ponytail: median words per cell; 2-word names stay ID-like
+# (the idea of AutoGluon's rule; these two numbers are ours). Other many-valued
+# strings -- cities, CPU models, codes -- are "string": short fragments that repeat.
+FREETEXT_MIN_UNIQUE = 0.5  # our starting point
+FREETEXT_MIN_WORDS = 3  # our starting point -- ponytail: median words per cell; 2-word names stay ID-like
 
 
 def detect_missing_values(df, detect_empty_strings=True):
@@ -228,7 +228,7 @@ _BOOLEAN_VALUE_SETS = [
 # uniform down a column, so a random sample decides it -- and a full-column
 # pd.to_datetime(format="mixed") parses one value at a time in Python (~10s on
 # a large text column, which is what hung the whole report).
-DATETIME_SAMPLE = 1000
+DATETIME_SAMPLE = 1000  # our starting point
 
 
 def text_kind(series):

@@ -13,6 +13,7 @@ path. ponytail: no deletion/retention yet (plan §24) -- add with auth.
 
 import json
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -22,10 +23,10 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
-import config
+from core import config
 
 ROOT = Path(config.DATA_DIR)
-CACHE_CAP = 5            # frames kept in memory; disk is the source of truth (our starting point)
+CACHE_CAP = config.STORE_CAP  # frames kept in memory; disk is the source of truth (STORE_CAP in backend/.env)
 _ID = re.compile(r"[0-9a-f]{12}")
 _cache = OrderedDict()
 _lock = threading.Lock()  # meta.json read-modify-write from concurrent requests
@@ -143,6 +144,41 @@ def run_dir(ds_id, run_id):
 def run_ids(ds_id):
     runs = _dir(ds_id) / "runs"
     return sorted(p.name for p in runs.iterdir() if _ID.fullmatch(p.name)) if runs.exists() else []
+
+
+def delete_run(ds_id, run_id):
+    shutil.rmtree(run_dir(ds_id, run_id), ignore_errors=True)
+
+
+def model_dir(ds_id, model_id):
+    return _dir(ds_id) / "models" / _check(model_id)
+
+
+def model_ids(ds_id):
+    root = _dir(ds_id) / "models"
+    return sorted(p.name for p in root.iterdir() if _ID.fullmatch(p.name)) if root.exists() else []
+
+
+def new_model_id(ds_id):
+    model_id = _new_id()
+    model_dir(ds_id, model_id).mkdir(parents=True)
+    return model_id
+
+
+def delete_model(ds_id, model_id):
+    shutil.rmtree(model_dir(ds_id, model_id), ignore_errors=True)
+
+
+def suggestion_path(ds_id, key):
+    folder = _dir(ds_id) / "suggestions"
+    folder.mkdir(exist_ok=True)
+    return folder / f"{_check(key)}.json"
+
+
+def size_mb(path):
+    path = Path(path)
+    files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()] if path.exists() else []
+    return round(sum(p.stat().st_size for p in files) / 1e6, 3)
 
 
 def all_run_dirs():

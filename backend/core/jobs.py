@@ -14,11 +14,11 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-import store
+from core import store
 
 DEFAULT_TIME_LIMIT_S = 3600   # spec §8: 60 min per run, our starting point
 _ACTIVE = {"queued", "running"}
-_pool = ThreadPoolExecutor(max_workers=1)  # one run at a time: a run already uses the cores
+_pool = ThreadPoolExecutor(max_workers=1)  # our starting point -- one run at a time: a run already uses the cores and the GPU
 _cancel = {}                  # run_id -> Event, only for runs owned by this process
 _futures = {}
 _lock = threading.Lock()

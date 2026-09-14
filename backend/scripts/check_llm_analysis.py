@@ -1,6 +1,6 @@
-from config import dataset_path
-from profiler import load_dataset, profile_dataset
-from llm import analyze_dataset
+from core.config import dataset_path
+from preprocessing.profiler import load_dataset, profile_dataset
+from assistant.llm import analyze_dataset
 
 
 profile = profile_dataset(load_dataset(dataset_path()))

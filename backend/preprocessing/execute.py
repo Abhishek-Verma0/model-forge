@@ -32,19 +32,26 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
-from profiler import is_numeric, missing_mask
-import advanced
-import clean
+from preprocessing import advanced, clean
+from preprocessing.profiler import is_numeric, missing_mask
 
+# Ordered: the Preprocessing tab lists them in this order (options() below).
 _SCALERS = {"standard": StandardScaler, "robust": RobustScaler, "minmax": MinMaxScaler}
-_IMPUTE = {"mean", "median", "most_frequent", "constant"}
-_ENCODE = {"onehot", "ordinal", "text"}
-_OUTLIER = {"clip_iqr", "remove_rows", "zscore", "winsorize"}
+_IMPUTE = ("median", "mean", "most_frequent", "constant")
+_ENCODE = ("onehot", "ordinal", "text")
+_OUTLIER = ("clip_iqr", "zscore", "winsorize", "remove_rows")
 # Defaults for op parameters the user can override per column (the UI sends them).
-IQR_K = 1.5              # clip_iqr / remove_rows fence width
-ZSCORE_THRESHOLD = 3.0   # zscore cutoff, in std devs
-WINSOR_LOWER = 0.05
-WINSOR_UPPER = 0.95
+IQR_K = 1.5              # published default: Tukey's fences, Q1/Q3 -/+ 1.5 x IQR
+ZSCORE_THRESHOLD = 3.0   # published default: the common 3-standard-deviation rule
+WINSOR_LOWER = 0.05      # our starting point: cap the lowest 5%
+WINSOR_UPPER = 0.95      # our starting point: cap the highest 5%
+# Split and dataset-level defaults (the request can override every one).
+TEST_SIZE = 0.2          # our starting point: 80:20 split
+TEST_SIZE_MIN, TEST_SIZE_MAX = 0.05, 0.5  # our starting point: accepted range
+RANDOM_STATE = 42        # our starting point: any fixed seed reproduces the split
+STRATIFY = True          # our starting point: keep class shares equal in train and test
+FS_K = 10                # our starting point: features kept by feature selection
+PCA_N = 2                # our starting point: PCA components
 
 _OPS = {"impute", "encode", "scale", "outliers", "drop_column", "drop_rows_missing"}
 
@@ -210,71 +217,62 @@ def guard_target(df, target, task):
     return df, notes
 
 
-def apply_plan(df, target, columns, task="classification", test_size=None,
-               random_state=None, pipeline=None, stratify=True):
-    """Run a validated per-column op plan, fit on train only. Returns preview,
-    cleaned CSV, and a per-column change summary. `pipeline` = optional
-    dataset-level stage (advanced impute / outlier removal / feature selection /
-    imbalance / reduction), all fit on train -- see advanced.py.
-
-    test_size / random_state default to 0.2 / 42 so the same settings
-    reproduce the same split; `stratify=False` forces a plain random split."""
-    test_size = 0.2 if test_size is None else float(test_size)
-    random_state = 42 if random_state is None else int(random_state)
-    if not 0.05 <= test_size <= 0.5:
-        raise ValueError(f"test_size must be between 0.05 and 0.5 (got {test_size}).")
-    df, target_notes = guard_target(df, target, task)
-    for _c, ops in columns.items():
-        for op in ops:
-            _validate(op)
-    pipeline = pipeline or {}
-    advanced.validate_pipeline(pipeline)
-
+def prepare_rows(df, target, columns, task):
+    """Target guard + whole-table row/column steps, shared by preprocessing and
+    training so both work on the same rows. Returns (df, feats, drop_cols, notes)."""
+    df, notes = guard_target(df, target, task)
     drop_cols = [c for c, ops in columns.items() if any(o["op"] == "drop_column" for o in ops)]
     row_cols = [c for c, ops in columns.items()
                 if any(o["op"] == "drop_rows_missing" for o in ops) and c in df.columns]
     if row_cols:
         df = df.dropna(subset=row_cols)
-
     feats = [c for c in df.columns if c != target and c not in drop_cols]
     if not feats:
         raise ValueError("No feature columns left after drops.")
     if len(df) < 5:
         raise ValueError("Too few rows left to split (need at least 5).")
+    return df, feats, drop_cols, notes
 
-    X, y = df[feats], df[target]
+
+def split(X, y, task, test_size, random_state, stratify):
+    """The locked train/test split -- one function, so training reproduces the
+    preprocessing run's split exactly. Returns (X_tr, X_te, y_tr, y_te, stratified)."""
     strat = y if (stratify and task == "classification" and y.nunique() > 1
                   and y.value_counts().min() >= 2) else None
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=strat
-    )
+        X, y, test_size=test_size, random_state=random_state, stratify=strat)
+    return X_tr, X_te, y_tr, y_te, strat is not None
 
-    # ---- dataset-level: advanced imputation (numeric block, fit on train) ----
-    pipe_notes = []
-    # Everything learned from train, so new rows get the identical transform
-    # (transform / to_matrix). Row-level steps are training-only and not kept.
-    fitted = {"sklearn": sklearn.__version__, "target": target, "features": feats,
-              "clean_ops": [], "impute": None, "columns": [], "text": {},
-              "keep": None, "pca": None,
-              "settings": {"columns": columns, "pipeline": pipeline, "task": task,
-                           "test_size": test_size, "random_state": random_state}}
+
+def fit_prep(X_tr, y_tr, columns, pipeline, task, intlike_cols):
+    """Learn every preprocessing step from the training rows only -- once per
+    preprocessing run, and once per CV fold in training. Returns (fitted, tr_out,
+    summary, notes, class_weights); replay with transform(fitted, X) + to_matrix.
+
+    Steps that add or drop TRAIN rows (outlier row removal, resampling) are not
+    applied here: CV folds must apply them to fold-training rows only, or copies of
+    scored rows leak into training (train.py adds them as samplers).
+    class_weights changes no rows, so it is computed."""
+    feats = list(X_tr.columns)
+    before = {c: str(X_tr[c].dtype) for c in feats}
+    notes = []
+    fitted = {"sklearn": sklearn.__version__, "features": feats, "clean_ops": [], "impute": None,
+              "columns": [], "text": {}, "keep": None, "pca": None}
+
     _imp = advanced._m("imputation", pipeline)
     if _imp:
-        intlike_cols = {c for c in feats if _is_intlike(df[c])}
-        X_tr, X_te, _n, fitted["impute"] = advanced.advanced_impute(
-            X_tr, X_te, _imp, intlike_cols,
-            (pipeline.get("imputation") or {}).get("n_neighbors"))
-        pipe_notes.append(_n)
+        fitted["impute"], _n = advanced.fit_impute(
+            X_tr, _imp, intlike_cols, (pipeline.get("imputation") or {}).get("n_neighbors"))
+        if fitted["impute"]:
+            X_tr = advanced.impute_apply(fitted["impute"], X_tr)
+        notes.append(_n)
 
-    tr_parts, te_parts, summary = [], [], []
+    parts, summary = [], []
     for c in feats:
-        ops = columns.get(c, [])
         tr = X_tr[[c]].copy()
-        te = X_te[[c]].copy()
-        intlike = _is_intlike(df[c])
-        before = str(df[c].dtype)
+        intlike = c in intlike_cols
         applied, replay = [], []
-        for o in ops:
+        for o in columns.get(c, []):
             name = o["op"]
             if name in ("drop_rows_missing",):
                 continue
@@ -282,45 +280,91 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
                 applied.append("outliers(remove_rows) - applied during training, inside each fold")
                 continue
             tr, st = _DISPATCH[name](o, c, tr, None, intlike)
-            te, _ = _DISPATCH[name](o, c, te, st, intlike)
             replay.append((o, st, intlike))
             if name == "encode" and o.get("method") == "text":
                 fitted["text"][c] = st
             applied.append(_label(name, o, tr.shape[1], st))
         fitted["columns"].append((c, replay))
-        tr_parts.append(tr)
-        te_parts.append(te)
+        parts.append(tr)
         after = f"{tr.shape[1]} cols" if tr.shape[1] > 1 else str(tr[tr.columns[0]].dtype)
-        summary.append({"column": c, "dtype_before": before, "dtype_after": after,
+        summary.append({"column": c, "dtype_before": before[c], "dtype_after": after,
                         "ops": applied or ["kept as-is"]})
+    tr_out = pd.concat(parts, axis=1)
 
-    tr_out = pd.concat(tr_parts, axis=1)
-    te_out = pd.concat(te_parts, axis=1)
-
-    # ---- dataset-level pipeline on the assembled numeric matrix (fit on train) ----
-    # Steps that add or drop TRAIN rows (outlier row removal, resampling) are not
-    # written into the export: CV folds must apply them to fold-training rows only,
-    # or copies of scored rows leak into training. Piece 1 reads them from
-    # fitted["settings"]. class_weights changes no rows, so it is still computed.
     class_weights = None
     if advanced._m("outlier_removal", pipeline):
-        pipe_notes.append(f"{advanced._m('outlier_removal', pipeline)} - applied during training, "
-                          "inside each fold (not written to the export)")
+        notes.append(f"{advanced._m('outlier_removal', pipeline)} - applied during training, "
+                     "inside each fold (not written to the export)")
     if advanced._m("feature_selection", pipeline):
-        k = (pipeline.get("feature_selection") or {}).get("k", 10)
-        tr_out, te_out, _n, fitted["keep"] = advanced.select_features(
-            tr_out, te_out, y_tr, advanced._m("feature_selection", pipeline), k, task)
-        pipe_notes.append(_n)
+        k = (pipeline.get("feature_selection") or {}).get("k", FS_K)
+        tr_out, _, _n, fitted["keep"] = advanced.select_features(
+            tr_out, tr_out.iloc[:0], y_tr, advanced._m("feature_selection", pipeline), k, task)
+        notes.append(_n)
     if advanced._m("reduction", pipeline):
-        n = (pipeline.get("reduction") or {}).get("n", 2)
-        tr_out, te_out, _n, fitted["pca"] = advanced.reduce(tr_out, te_out, advanced._m("reduction", pipeline), n)
-        pipe_notes.append(_n)
+        fitted["pca"], _n = advanced.fit_reduce(tr_out, (pipeline.get("reduction") or {}).get("n", PCA_N))
+        if fitted["pca"]:
+            tr_out = advanced.reduce_apply(fitted["pca"], tr_out)
+        notes.append(_n)
     _imb = advanced._m("imbalance", pipeline)
     if _imb == "class_weights":
         tr_out, y_tr, _n, class_weights = advanced.balance(tr_out, y_tr, _imb, task)
-        pipe_notes.append(_n)
+        notes.append(_n)
     elif _imb:
-        pipe_notes.append(f"{_imb} - applied during training, inside each fold (not written to the export)")
+        notes.append(f"{_imb} - applied during training, inside each fold (not written to the export)")
+    return fitted, tr_out, summary, notes, class_weights
+
+
+def options():
+    """Choices and defaults for the Preprocessing tab -- the single source; the UI
+    renders these instead of keeping its own copies."""
+    from preprocessing.detector import MAX_CATEGORICAL_UNIQUE
+    return {
+        "split": {"test_size": TEST_SIZE, "test_size_min": TEST_SIZE_MIN, "test_size_max": TEST_SIZE_MAX,
+                  "random_state": RANDOM_STATE, "stratify": STRATIFY},
+        "missing": ["none", *_IMPUTE, "drop_rows", "drop_column"],
+        "scale": ["none", *_SCALERS],
+        "outliers": ["none", *_OUTLIER],
+        "encode": ["none", *_ENCODE, "drop"],
+        "outlier_defaults": {"clip_iqr": {"k": IQR_K}, "remove_rows": {"k": IQR_K},
+                             "zscore": {"threshold": ZSCORE_THRESHOLD},
+                             "winsorize": {"lower": WINSOR_LOWER, "upper": WINSOR_UPPER}},
+        "pipeline": {"imputation": ["none", *advanced._IMPUTE], "outlier_removal": ["none", *advanced._OUTREM],
+                     "feature_selection": ["none", *advanced._FS], "imbalance": ["none", *advanced._IMB],
+                     "reduction": ["none", *advanced._RED]},
+        "pipeline_defaults": {"knn_n": advanced.KNN_NEIGHBORS, "contamination": advanced.CONTAMINATION,
+                              "fs_k": FS_K, "red_n": PCA_N},
+        "max_onehot": MAX_CATEGORICAL_UNIQUE,  # more distinct values than this: too many to one-hot
+    }
+
+
+def apply_plan(df, target, columns, task="classification", test_size=None,
+               random_state=None, pipeline=None, stratify=STRATIFY):
+    """Run a validated per-column op plan, fit on train only. Returns preview,
+    cleaned CSV, a per-column change summary and the fitted pipeline. `pipeline` =
+    optional dataset-level stage (advanced impute / outlier removal / feature
+    selection / imbalance / reduction) -- see fit_prep and advanced.py.
+
+    test_size / random_state default to TEST_SIZE / RANDOM_STATE so the same settings
+    reproduce the same split; `stratify=False` forces a plain random split."""
+    test_size = TEST_SIZE if test_size is None else float(test_size)
+    random_state = RANDOM_STATE if random_state is None else int(random_state)
+    if not TEST_SIZE_MIN <= test_size <= TEST_SIZE_MAX:
+        raise ValueError(f"test_size must be between {TEST_SIZE_MIN} and {TEST_SIZE_MAX} (got {test_size}).")
+    for _c, ops in columns.items():
+        for op in ops:
+            _validate(op)
+    pipeline = pipeline or {}
+    advanced.validate_pipeline(pipeline)
+
+    df, feats, drop_cols, target_notes = prepare_rows(df, target, columns, task)
+    X_tr, X_te, y_tr, y_te, stratified = split(df[feats], df[target], task, test_size, random_state, stratify)
+    intlike_cols = {c for c in feats if _is_intlike(df[c])}
+    fitted, tr_out, summary, pipe_notes, class_weights = fit_prep(
+        X_tr, y_tr, columns, pipeline, task, intlike_cols)
+    fitted["target"] = target
+    fitted["settings"] = {"columns": columns, "pipeline": pipeline, "task": task, "test_size": test_size,
+                          "random_state": random_state, "stratify": stratify}
+    te_out = transform(fitted, X_te)
 
     tr_out = tr_out.reset_index(drop=True)
     te_out = te_out.reset_index(drop=True)
@@ -335,7 +379,7 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
         "features_in": len(feats),
         "features_out": tr_out.shape[1] - 2,  # minus target + __split__
         "dropped_columns": drop_cols,
-        "stratified": strat is not None,
+        "stratified": stratified,
         "test_size": test_size,
         "random_state": random_state,
         "summary": summary,
@@ -379,7 +423,12 @@ def to_matrix(fitted, frame):
     feature columns."""
     from scipy.sparse import csr_matrix, hstack
     text = fitted["text"]
-    blocks = [csr_matrix(frame.drop(columns=list(text)).astype("float64").to_numpy())]
+    rest = frame.drop(columns=list(text))
+    bad = [str(c) for c in rest.columns if not pd.api.types.is_numeric_dtype(rest[c])]
+    if bad:
+        raise ValueError(f"Column(s) {', '.join(bad[:5])} are not numbers yet -- choose an encoding "
+                         "(onehot, ordinal or text) for them on the Preprocessing tab.")
+    blocks = [csr_matrix(rest.astype("float64").to_numpy())]
     for c, vecs in text.items():
         blocks += [v.transform(frame[c].fillna("").astype(str)) for v in vecs]
     return hstack(blocks).tocsr()
@@ -540,4 +589,37 @@ if __name__ == "__main__":
     cw = apply_plan(imb, "y", {}, pipeline={"imbalance": {"method": "class_weights"}})
     assert cw["class_weights"] and cw["train_rows"] == 48, cw["class_weights"]
     print("row-changing steps self-check passed")
+
+    # fit_prep is the single fitting path; to_matrix names columns that still need an encoding
+    fx = pd.DataFrame({"a": [1.0, None, 3.0, 4.0, 5.0, 6.0], "s": list("xyxyxy")})
+    fitted_fx, tr_fx, summ_fx, notes_fx, _ = fit_prep(
+        fx, pd.Series([0, 1] * 3), {"a": [{"op": "impute", "strategy": "median"}]}, {}, "classification", set())
+    assert tr_fx["a"].tolist() == [1.0, 4.0, 3.0, 4.0, 5.0, 6.0], tr_fx["a"].tolist()
+    assert summ_fx[0]["ops"] == ["impute(median)"] and fitted_fx["features"] == ["a", "s"]
+    try:
+        to_matrix(fitted_fx, tr_fx)
+        raise AssertionError("an unencoded text column must be refused")
+    except ValueError as e:
+        assert "s" in str(e) and "encoding" in str(e), e
+    assert apply_plan(fx.assign(y=[0, 1] * 3), "y", {})["fitted"]["settings"]["stratify"] is True
+    print("fit_prep self-check passed")
+
+    # options() is what the Preprocessing tab renders: every choice must pass validation
+    o = options()
+    ui_only = {"none", "drop_rows", "drop_column", "drop"}
+    for m in set(o["missing"]) - ui_only:
+        _validate({"op": "impute", "strategy": m})
+    for m in set(o["scale"]) - ui_only:
+        _validate({"op": "scale", "method": m})
+    for m in set(o["encode"]) - ui_only:
+        _validate({"op": "encode", "method": m})
+    for m, params in o["outlier_defaults"].items():
+        assert m in o["outliers"], m
+        _validate({"op": "outliers", "method": m, **params})
+    for section, methods in o["pipeline"].items():
+        for m in methods:
+            advanced.validate_pipeline({section: {"method": m}})
+    assert o["split"]["test_size_min"] <= o["split"]["test_size"] <= o["split"]["test_size_max"]
+    json.dumps(o)  # sent inside the analyze response
+    print("options self-check passed")
     print("split + parameter self-check passed")

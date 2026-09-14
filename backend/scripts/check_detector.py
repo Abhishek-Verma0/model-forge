@@ -1,8 +1,8 @@
 import json
 
-from config import dataset_path
-from profiler import load_dataset
-from detector import run_quality_report
+from core.config import dataset_path
+from preprocessing.profiler import load_dataset
+from preprocessing.detector import run_quality_report
 
 
 path = dataset_path()

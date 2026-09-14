@@ -4,6 +4,9 @@ venv/
 env/
 
 docs/
+/catboost_info
+/data
+
 
 # Python bytecode / caches
 __pycache__/
@@ -13,6 +16,7 @@ __pycache__/
 
 # Generated
 preprocessing/report.json
+report.json
 data/
 
 # Secrets

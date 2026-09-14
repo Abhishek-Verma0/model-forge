@@ -8,14 +8,12 @@ import EdaGallery from "./eda";
 import ChartBuilder from "./builder";
 import Clean from "./clean";
 import Preprocess from "./preprocess";
+import Train from "./train";
 import ChatPanel from "./chat";
 import Landing from "./landing";
 import DatasetUpload from "./upload";
 import DatasetPreview from "./preview";
-
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const MAX_MB = 200;
-const ALLOWED = [".csv", ".xlsx", ".xls"];
+import { API } from "./apiclient";
 
 // What each detected issue means for preprocessing. Read-only for now — the
 // backend has no "apply" endpoint yet, so these are recommendations, not buttons.
@@ -50,17 +48,23 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  // Upload limits come from the backend (MAX_UPLOAD_MB in backend/.env), never a copy here.
+  // If they can't be loaded the quick check is skipped -- the backend still enforces them.
+  const [limits, setLimits] = useState(null);
+  useEffect(() => {
+    fetch(`${API}/api/upload/limits`).then((r) => (r.ok ? r.json() : null)).then(setLimits).catch(() => {});
+  }, []);
 
   function pick(f) {
     setError("");
     if (!f) return;
     const ext = f.name.slice(f.name.lastIndexOf(".")).toLowerCase();
-    if (!ALLOWED.includes(ext)) {
-      setError(`Unsupported file type "${ext}". Use CSV or Excel (${ALLOWED.join(", ")}).`);
+    if (limits && !limits.allowed.includes(ext)) {
+      setError(`Unsupported file type "${ext}". Use CSV or Excel (${limits.allowed.join(", ")}).`);
       return;
     }
-    if (f.size > MAX_MB * 1024 * 1024) {
-      setError(`File is ${(f.size / 1024 / 1024).toFixed(0)} MB — the limit is ${MAX_MB} MB.`);
+    if (limits && f.size > limits.max_mb * 1024 * 1024) {
+      setError(`File is ${(f.size / 1024 / 1024).toFixed(0)} MB — the limit is ${limits.max_mb} MB.`);
       return;
     }
     setFile(f);
@@ -196,6 +200,17 @@ export default function Page() {
             <span className="nav-btn-text">ML Preprocessing</span>
             {!result && <span className="nav-lock-badge">🔒</span>}
           </button>
+
+          <button
+            type="button"
+            className={`sidebar-nav-btn ${activeTab === "training" ? "active" : ""}`}
+            onClick={() => result && setActiveTab("training")}
+            disabled={!result}
+          >
+            <span className="nav-btn-icon">🧠</span>
+            <span className="nav-btn-text">Model Training</span>
+            {!result && <span className="nav-lock-badge">🔒</span>}
+          </button>
         </nav>
 
         <div className="sidebar-footer">
@@ -239,6 +254,8 @@ export default function Page() {
                       ? "Data Cleaning"
                       : activeTab === "eda"
                       ? "Visual EDA"
+                      : activeTab === "training"
+                      ? "Model Training"
                       : "ML Preprocessing"
                   }`}
             </span>
@@ -272,6 +289,7 @@ export default function Page() {
               error={error}
               onAnalyze={analyze}
               onReset={reset}
+              limits={limits}
             />
           ) : activeTab === "preview" ? (
             <DatasetPreview
@@ -331,9 +349,13 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
   const [planErr, setPlanErr] = useState("");
   const [livePlan, setLivePlan] = useState(null); // user's edited plan -> chat memory
   const [rev, setRev] = useState(0);               // bumps when data is cleaned, to reset child state
+  const [prepRev, setPrepRev] = useState(0);       // bumps after each preprocess, so Train re-reads options + AI picks
+  const [trainResults, setTrainResults] = useState(null); // the run shown on the Train tab -> chat context
+  const [chatAsk, setChatAsk] = useState(null);           // {text, n}: a question sent to the chat by a button
 
   useEffect(() => {
     let cancel = false;
+    setPlan(null);          // never show or apply the previous target's plan while the new one loads
     setPlanLoading(true);
     setPlanErr("");
     fetch(`${API}/api/plan`, {
@@ -414,6 +436,9 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
           onClick={() => setTab("preprocessing")}
         >
           Preprocessing
+        </button>
+        <button className={tab === "training" ? "tab on" : "tab"} onClick={() => setTab("training")}>
+          Train
         </button>
       </div>
 
@@ -664,13 +689,20 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
           planLoading={planLoading}
           planErr={planErr}
           onPlan={setLivePlan}
+          onDone={() => setPrepRev((r) => r + 1)}
         />
+      </div>
+
+      {/* ===== TRAINING TAB ===== */}
+      <div hidden={tab !== "training"}>
+        <Train key={`train:${rev}:${prepRev}`} data={data} target={target} active={tab === "training"}
+               onResults={setTrainResults} onAsk={(text) => setChatAsk((a) => ({ text, n: (a?.n || 0) + 1 }))} />
       </div>
 
         </div>{/* /report-main */}
 
         <aside className="chat-dock">
-          <ChatPanel data={data} target={target} task={task} plan={livePlan} />
+          <ChatPanel data={data} target={target} task={task} plan={livePlan} results={trainResults} asked={chatAsk} />
         </aside>
       </div>{/* /report-row */}
     </>

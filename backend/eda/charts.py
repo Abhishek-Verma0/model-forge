@@ -7,7 +7,7 @@ dropped. pandas does .corr(); no new dependency.
 
 import pandas as pd
 
-from profiler import is_numeric
+from preprocessing.profiler import is_numeric
 
 
 def chart_data(df):

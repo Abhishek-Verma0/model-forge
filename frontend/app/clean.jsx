@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API } from "./apiclient";
 const RETYPE_OPTS = ["keep", "number", "datetime", "category"];
 
 // One AI clean op -> plain words, so the user can SEE the suggestion.

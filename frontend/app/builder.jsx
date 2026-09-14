@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API } from "./apiclient";
 const KINDS = ["histogram", "density", "box", "violin", "scatter", "line", "bar", "pie", "tsne"];
 const NEEDS_Y = ["scatter", "line"];   // plotted against a second column
 

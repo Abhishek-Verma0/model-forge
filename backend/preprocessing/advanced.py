@@ -26,15 +26,16 @@ scatter/pairplot already cover 2-D visualization.
 import numpy as np
 import pandas as pd
 
-CONTAMINATION = 0.05      # IsolationForest expected outlier share (pipeline can override)
-KNN_NEIGHBORS = 5         # KNNImputer neighbours (pipeline can override)
-ITERATIVE_MAX_ITER = 10
+CONTAMINATION = 0.05      # our starting point: IsolationForest expected outlier share (scikit-learn's is "auto")
+KNN_NEIGHBORS = 5         # published default: scikit-learn KNNImputer n_neighbors=5
+ITERATIVE_MAX_ITER = 10   # published default: scikit-learn IterativeImputer max_iter=10
 
-_IMPUTE = {"knn", "iterative"}
-_OUTREM = {"isolation_forest"}
-_FS = {"correlation", "chi2", "anova", "mutual_info", "rfe"}
-_IMB = {"oversample", "undersample", "smote", "class_weights"}
-_RED = {"pca"}
+# Ordered: the Preprocessing tab lists them in this order (execute.options).
+_IMPUTE = ("knn", "iterative")
+_OUTREM = ("isolation_forest",)
+_FS = ("correlation", "chi2", "anova", "mutual_info", "rfe")
+_IMB = ("oversample", "undersample", "smote", "class_weights")
+_RED = ("pca",)
 
 
 def _m(section, p):
@@ -60,14 +61,13 @@ def validate_pipeline(p):
 
 # --- advanced imputation (numeric block, before encoding) -------------------
 
-def advanced_impute(X_tr, X_te, method, intlike_cols, n_neighbors=None):
-    """KNN / iterative imputation of ALL numeric feature columns at once, fit on
-    train. Returns (X_tr, X_te, note, state); impute_apply(state, X) replays it on
-    new rows. intlike_cols are rounded back to integers."""
+def fit_impute(X_tr, method, intlike_cols, n_neighbors=None):
+    """Fit KNN / iterative imputation on ALL numeric train columns. Returns
+    (state, note); state is None when there is nothing numeric."""
     from sklearn.impute import KNNImputer
     num = [c for c in X_tr.columns if pd.api.types.is_numeric_dtype(X_tr[c])]
     if not num:
-        return X_tr, X_te, "no numeric columns to impute", None
+        return None, "no numeric columns to impute"
     if method == "iterative":
         from sklearn.experimental import enable_iterative_imputer  # noqa: F401
         from sklearn.impute import IterativeImputer
@@ -75,8 +75,16 @@ def advanced_impute(X_tr, X_te, method, intlike_cols, n_neighbors=None):
     else:
         imp = KNNImputer(n_neighbors=int(n_neighbors or KNN_NEIGHBORS))
     state = {"imp": imp.fit(X_tr[num]), "num": num, "int": [c for c in num if c in intlike_cols]}
-    return (impute_apply(state, X_tr), impute_apply(state, X_te),
-            f"{method} imputation on {len(num)} numeric column(s)", state)
+    return state, f"{method} imputation on {len(num)} numeric column(s)"
+
+
+def advanced_impute(X_tr, X_te, method, intlike_cols, n_neighbors=None):
+    """Fit on train, apply to train + test. Returns (X_tr, X_te, note, state);
+    impute_apply(state, X) replays it on new rows."""
+    state, note = fit_impute(X_tr, method, intlike_cols, n_neighbors)
+    if state is None:
+        return X_tr, X_te, note, None
+    return impute_apply(state, X_tr), impute_apply(state, X_te), note, state
 
 
 def impute_apply(state, X):
@@ -186,16 +194,22 @@ def balance(X_tr, y_tr, method, task):
 
 # --- dimensionality reduction (fit on train) --------------------------------
 
-def reduce(X_tr, X_te, method, n):
+def fit_reduce(X_tr, n):
     from sklearn.decomposition import PCA
     num = X_tr.select_dtypes("number")
     if num.shape[1] < 2:
-        return X_tr, X_te, "too few numeric features for reduction", None
+        return None, "too few numeric features for reduction"
     n = max(1, min(int(n or 2), num.shape[1]))
     state = {"pca": PCA(n_components=n, random_state=0).fit(num), "num": list(num.columns)}
     var = round(float(state["pca"].explained_variance_ratio_.sum()) * 100, 1)
-    return (reduce_apply(state, X_tr), reduce_apply(state, X_te),
-            f"PCA -> {n} component(s), {var}% variance retained", state)
+    return state, f"PCA -> {n} component(s), {var}% variance retained"
+
+
+def reduce(X_tr, X_te, method, n):
+    state, note = fit_reduce(X_tr, n)
+    if state is None:
+        return X_tr, X_te, note, None
+    return reduce_apply(state, X_tr), reduce_apply(state, X_te), note, state
 
 
 def reduce_apply(state, X):

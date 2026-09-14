@@ -14,8 +14,8 @@ import seaborn as sns            # noqa: E402
 
 sns.set_theme(style="whitegrid")
 
-SAMPLE = 5000        # point-heavy charts sample this many rows
-MAX_BAR_CATS = 50    # a bar chart of 745k unique ids would melt -- refuse it
+SAMPLE = 5000        # our starting point: point-heavy charts sample this many rows
+MAX_BAR_CATS = 50    # our starting point: a bar chart of 745k unique ids would melt -- refuse it
 
 # For box/violin the user's chosen column is the numeric distribution (seaborn y)
 # and hue is the group (seaborn x).

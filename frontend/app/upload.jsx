@@ -43,6 +43,7 @@ export default function DatasetUpload({
   error,
   onAnalyze,
   onReset,
+  limits, // {max_mb, allowed} from the backend (/api/upload/limits); null until loaded
 }) {
   const [dragOver, setDragOver] = useState(false);
   const [sampleLoading, setSampleLoading] = useState(false);
@@ -113,7 +114,7 @@ export default function DatasetUpload({
         <input
           ref={inputRef}
           type="file"
-          accept=".csv,.xlsx,.xls"
+          accept={limits?.allowed.join(",")}
           hidden
           onChange={(e) => handleFileSelect(e.target.files?.[0])}
         />
@@ -145,9 +146,9 @@ export default function DatasetUpload({
             </button>
 
             <div className="dropzone-limits">
-              <span>Supported formats: <strong>CSV, XLSX, XLS</strong></span>
+              <span>Supported formats: <strong>{limits ? limits.allowed.map((x) => x.slice(1).toUpperCase()).join(", ") : "…"}</strong></span>
               <span className="limits-dot">·</span>
-              <span>Max size: <strong>200 MB</strong></span>
+              <span>Max size: <strong>{limits ? `${limits.max_mb} MB` : "…"}</strong></span>
             </div>
           </div>
         ) : (

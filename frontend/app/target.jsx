@@ -1,6 +1,7 @@
 "use client";
 
 // Common target-column names, checked before falling back to a shape heuristic.
+// Our starting point: only picks the pre-selected suggestion; the user always chooses.
 const NAME_HINTS = [
   "target", "label", "class", "outcome", "result", "churn", "survived",
   "default", "fraud", "fallen", "fall", "diagnosis", "disease", "y",

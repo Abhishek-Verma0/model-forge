@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { recommendedPlan } from "./preprocess";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API } from "./apiclient";
 
 // Tiny, safe markdown -> HTML for chat bubbles: escape first (LLM output is
 // untrusted), then bold / inline-code / bullets / line breaks. ponytail: not
@@ -18,28 +18,56 @@ function mdToHtml(t) {
     .replace(/\n/g, "<br/>");
 }
 
-// Docked AI chat about preprocessing. Seeds one suggestion from the target on
-// first load, then keeps the whole conversation -- history is NOT cleared when
-// the target or tab changes. Each turn sends the history + the current plan.
-export default function ChatPanel({ data, target, task, plan }) {
+const MAX_FACT_COLUMNS = 100; // our starting point: keeps very wide tables inside the AI's context window
+
+// Measured facts (profile + audit) for EVERY column -- no data rows -- so the AI can
+// judge the chosen target against the alternatives instead of defending the choice.
+function columnFacts(data) {
+  const checks = data.report.checks;
+  return data.profile.column_names.slice(0, MAX_FACT_COLUMNS).map((name) => {
+    const info = data.profile.columns_info[name];
+    return {
+      name,
+      detected_type: checks.column_types.columns.find((c) => c.column === name)?.detected_type,
+      unique_values: info.unique_values,
+      missing_percent: info.missing_percent,
+      is_constant: info.is_constant,
+      looks_like_id: checks.id_columns.columns.some((c) => c.column === name),
+      top_values: info.top_values?.slice(0, 5),
+      statistics: info.statistics,
+    };
+  });
+}
+
+// Docked AI chat about preprocessing. Asks for a suggestion every time the target
+// changes (a target picked by mistake, or a second look at another column); the
+// conversation history is kept. Each turn sends the history + the current plan.
+export default function ChatPanel({ data, target, task, plan, results, asked }) {
   const [messages, setMessages] = useState([]); // {role:"user"|"assistant", content}
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const bodyRef = useRef(null);
-  const seeded = useRef(false);
+  const inFlight = useRef(null);  // AbortController of the reply being streamed
 
-  // Seed once, when the user FIRST picks a target (not auto). History is kept
-  // after -- changing the target later never wipes the conversation.
   useEffect(() => {
-    if (!data.id || !target || seeded.current) return;
-    seeded.current = true;
+    if (!data.id || !target) return;
+    setMessages((m) => [...m, { role: "user", content: `Target: ${target}` }]);
     ask(
-      `I want to predict "${target}". Which columns need cleaning or preprocessing, and why? Answer in a few short, simple sentences.`,
+      `I selected "${target}" as the column to predict. First, is that a sensible choice for this dataset, ` +
+      `or is another column a more natural target? Be honest, even if it disagrees with my choice. ` +
+      `Then, which columns need cleaning or preprocessing, and why? ` +
+      `Answer in a few short, simple sentences.`,
       true
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data.id, target]);
+
+  // a question sent from a button elsewhere on the page (e.g. "Ask AI" on a result row)
+  useEffect(() => {
+    if (asked?.text) ask(asked.text);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [asked?.n]);
 
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight });
@@ -48,17 +76,26 @@ export default function ChatPanel({ data, target, task, plan }) {
   async function ask(text, seed = false) {
     const outgoing = seed ? [{ role: "user", content: text }] : [...messages, { role: "user", content: text }];
     if (!seed) setMessages((m) => [...m, { role: "user", content: text }]);
+    inFlight.current?.abort();      // a newer question replaces a reply still streaming
+    const ctrl = new AbortController();
+    inFlight.current = ctrl;
     setLoading(true);
     setErr("");
     try {
       const res = await fetch(`${API}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: ctrl.signal,
         body: JSON.stringify({
           messages: outgoing.map(({ role, content }) => ({ role, content })),
-          // live edited plan when available (so the AI remembers the user's
-          // decisions), else the rule-based recommendation.
-          context: plan || recommendedPlan(data, target, task),
+          // live edited plan when it belongs to this target (so the AI remembers the
+          // user's decisions), else the rule-based recommendation for this target.
+          context: {
+            ...(plan?.target === target ? plan : recommendedPlan(data, target, task)),
+            rows: data.profile.rows,
+            dataset_facts: columnFacts(data),
+            results, // the training run on the page; the backend keeps only what the question needs
+          },
         }),
       });
       if (!res.ok) {
@@ -92,9 +129,10 @@ export default function ChatPanel({ data, target, task, plan }) {
       }
       if (!started) setMessages((m) => [...m, { role: "assistant", content: "(no response)" }]);
     } catch (e) {
+      if (e.name === "AbortError") return;   // replaced by a newer question
       setErr(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
     } finally {
-      setLoading(false);
+      if (inFlight.current === ctrl) setLoading(false);
     }
   }
 
