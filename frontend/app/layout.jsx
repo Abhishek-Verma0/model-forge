@@ -1,5 +1,11 @@
 import "./globals.css";
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 5,
+};
+
 export const metadata = {
   title: "Model Forge — Automated Data Preprocessing & ML Studio",
   description: "Audit data quality, eliminate leakage, engineer features, and forge production-ready ML preprocessing pipelines with AI.",

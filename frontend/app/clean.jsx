@@ -261,12 +261,12 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
                   ? `AI: “${aiNames[c]}”`
                   : "";
             return (
-              <div key={c} style={{ display: "flex", alignItems: "center", gap: 8, opacity: dropped ? 0.5 : 1 }}>
+              <div key={c} style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, opacity: dropped ? 0.5 : 1 }}>
                 <input
                   value={nm}
                   disabled={isTarget || dropped}
                   onChange={(e) => setName(c, e.target.value)}
-                  style={{ flex: "0 0 220px", padding: "4px 8px", fontSize: 13 }}
+                  style={{ flex: "1 1 160px", minWidth: 120, maxWidth: 260, padding: "4px 8px", fontSize: 13 }}
                   title={c}
                 />
                 <span className="note" style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>

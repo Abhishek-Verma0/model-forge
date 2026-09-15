@@ -41,6 +41,7 @@ const num = (v) =>
 export default function Page() {
   const [viewMode, setViewMode] = useState("landing");
   const [activeTab, setActiveTab] = useState("upload");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [file, setFile] = useState(null);
   const [datasetName, setDatasetName] = useState("");
   const [taskType, setTaskType] = useState("auto");
@@ -113,15 +114,29 @@ export default function Page() {
     setActiveTab("upload");
   }
 
+  function switchTab(t) {
+    setActiveTab(t);
+    setMobileNavOpen(false);
+  }
+
   if (viewMode === "landing") {
     return <Landing onLaunchStudio={() => setViewMode("studio")} />;
   }
 
   return (
     <div className="studio-app-shell">
+      {/* Mobile Drawer Backdrop */}
+      {mobileNavOpen && (
+        <div
+          className="studio-sidebar-backdrop"
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
       {/* Sidebar matching reference dashboard */}
-      <aside className="studio-sidebar">
-        <div className="sidebar-brand" onClick={() => setViewMode("landing")}>
+      <aside className={`studio-sidebar ${mobileNavOpen ? "mobile-open" : ""}`}>
+        <div className="sidebar-brand" onClick={() => { setViewMode("landing"); setMobileNavOpen(false); }}>
           <div className="brand-icon-box small">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
               <path d="M12 2v8M4.93 10.93 9.17 15.17M2 18h20M20 18v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2M7 14h10l-2-4H9l-2 4Z" />
@@ -138,7 +153,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "upload" ? "active" : ""}`}
-            onClick={() => setActiveTab("upload")}
+            onClick={() => switchTab("upload")}
           >
             <span className="nav-btn-icon">📂</span>
             <span className="nav-btn-text">Upload Dataset</span>
@@ -148,7 +163,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "preview" ? "active" : ""}`}
-            onClick={() => result && setActiveTab("preview")}
+            onClick={() => result && switchTab("preview")}
             disabled={!result}
           >
             <span className="nav-btn-icon">👁️</span>
@@ -160,7 +175,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "insights" ? "active" : ""}`}
-            onClick={() => result && setActiveTab("insights")}
+            onClick={() => result && switchTab("insights")}
             disabled={!result}
           >
             <span className="nav-btn-icon">🛡️</span>
@@ -171,7 +186,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "cleaning" ? "active" : ""}`}
-            onClick={() => result && setActiveTab("cleaning")}
+            onClick={() => result && switchTab("cleaning")}
             disabled={!result}
           >
             <span className="nav-btn-icon">🧹</span>
@@ -182,7 +197,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "eda" ? "active" : ""}`}
-            onClick={() => result && setActiveTab("eda")}
+            onClick={() => result && switchTab("eda")}
             disabled={!result}
           >
             <span className="nav-btn-icon">📊</span>
@@ -193,7 +208,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "preprocessing" ? "active" : ""}`}
-            onClick={() => result && setActiveTab("preprocessing")}
+            onClick={() => result && switchTab("preprocessing")}
             disabled={!result}
           >
             <span className="nav-btn-icon">⚙️</span>
@@ -204,7 +219,7 @@ export default function Page() {
           <button
             type="button"
             className={`sidebar-nav-btn ${activeTab === "training" ? "active" : ""}`}
-            onClick={() => result && setActiveTab("training")}
+            onClick={() => result && switchTab("training")}
             disabled={!result}
           >
             <span className="nav-btn-icon">🧠</span>
@@ -225,7 +240,7 @@ export default function Page() {
           <button
             type="button"
             className="btn-sidebar-back"
-            onClick={() => setViewMode("landing")}
+            onClick={() => { setViewMode("landing"); setMobileNavOpen(false); }}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
               <path d="M19 12H5M12 19l-7-7 7-7" />
@@ -239,26 +254,43 @@ export default function Page() {
       <main className="studio-main-viewport">
         {/* Top Header */}
         <header className="studio-header-strip">
-          <div className="header-breadcrumbs">
-            <span className="bc-home" onClick={() => setViewMode("landing")}>Model Forge</span>
-            <span className="bc-divider">/</span>
-            <span className="bc-active">
-              {activeTab === "upload" || !result
-                ? "Dataset Ingestion"
-                : `${result.filename} · ${
-                    activeTab === "preview"
-                      ? "Dataset Preview"
-                      : activeTab === "insights"
-                      ? "Quality Audit"
-                      : activeTab === "cleaning"
-                      ? "Data Cleaning"
-                      : activeTab === "eda"
-                      ? "Visual EDA"
-                      : activeTab === "training"
-                      ? "Model Training"
-                      : "ML Preprocessing"
-                  }`}
-            </span>
+          <div className="header-left-cluster">
+            <button
+              type="button"
+              className="btn-mobile-menu-toggle"
+              onClick={() => setMobileNavOpen((o) => !o)}
+              aria-label="Toggle navigation menu"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                {mobileNavOpen ? (
+                  <path d="M18 6 6 18M6 6l12 12" />
+                ) : (
+                  <path d="M4 6h16M4 12h16M4 18h16" />
+                )}
+              </svg>
+            </button>
+
+            <div className="header-breadcrumbs">
+              <span className="bc-home" onClick={() => setViewMode("landing")}>Model Forge</span>
+              <span className="bc-divider">/</span>
+              <span className="bc-active">
+                {activeTab === "upload" || !result
+                  ? "Dataset Ingestion"
+                  : `${result.filename} · ${
+                      activeTab === "preview"
+                        ? "Dataset Preview"
+                        : activeTab === "insights"
+                        ? "Quality Audit"
+                        : activeTab === "cleaning"
+                        ? "Data Cleaning"
+                        : activeTab === "eda"
+                        ? "Visual EDA"
+                        : activeTab === "training"
+                        ? "Model Training"
+                        : "ML Preprocessing"
+                    }`}
+              </span>
+            </div>
           </div>
 
           <div className="header-status-area">

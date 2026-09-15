@@ -1,5 +1,7 @@
 "use client";
 
+import Image from "next/image";
+
 // Backend-rendered EDA charts (matplotlib/seaborn) arrive as base64 PNG data
 // URIs in data.eda = [{title, image}]. We just show them and offer a download.
 export default function EdaGallery({ data }) {
@@ -22,7 +24,18 @@ export default function EdaGallery({ data }) {
             <div className="chart-title" title={c.title}>
               {c.title}
             </div>
-            <img src={c.image} alt={c.title} className="eda-img" />
+            <div className="eda-img-wrap">
+              <Image
+                src={c.image}
+                alt={c.title}
+                width={640}
+                height={420}
+                sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw"
+                className="eda-img"
+                style={{ width: "100%", height: "auto" }}
+                unoptimized
+              />
+            </div>
             <button className="ghost eda-dl" onClick={() => download(c.image, c.title)}>
               Download PNG
             </button>

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Image from "next/image";
 
 import { API } from "./apiclient";
 const KINDS = ["histogram", "density", "box", "violin", "scatter", "line", "bar", "pie", "tsne"];
@@ -19,44 +20,41 @@ export default function ChartBuilder({ data }) {
 
   if (!id) return null; // backend hasn't added the dataset store / id yet
 
-  const needsY = NEEDS_Y.includes(kind);
   const params = new URLSearchParams({ id, kind, x });
-  if (needsY) params.set("y", y);
+  if (NEEDS_Y.includes(kind)) params.set("y", y);
   if (hue) params.set("hue", hue);
   const src = `${API}/api/chart?${params.toString()}`;
 
-  async function download(fmt) {
-    const res = await fetch(`${src}&fmt=${fmt}`);
-    if (!res.ok) return;
-    const url = URL.createObjectURL(await res.blob());
+  function download(fmt) {
+    const p = new URLSearchParams(params);
+    p.set("fmt", fmt);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `${kind}_${x}${needsY ? "_" + y : ""}.${fmt}`;
+    a.href = `${API}/api/chart?${p.toString()}`;
+    a.download = `chart_${kind}_${x}.${fmt}`;
     a.click();
-    URL.revokeObjectURL(url);
   }
 
   return (
     <section>
-      <p className="sectitle">Build a chart</p>
+      <p className="sectitle">Chart builder</p>
       <div className="panel" style={{ padding: 16 }}>
         <div className="builder-row">
-          <Field label="Chart">
+          <Field label="Chart type">
             <select value={kind} onChange={(e) => setKind(e.target.value)}>
               {KINDS.map((k) => (
                 <option key={k} value={k}>{k}</option>
               ))}
             </select>
           </Field>
-          <Field label={needsY ? "X" : "Column"}>
+          <Field label="X axis">
             <select value={x} onChange={(e) => setX(e.target.value)}>
               {cols.map((c) => (
                 <option key={c} value={c}>{c}</option>
               ))}
             </select>
           </Field>
-          {needsY && (
-            <Field label="Y">
+          {NEEDS_Y.includes(kind) && (
+            <Field label="Y axis">
               <select value={y} onChange={(e) => setY(e.target.value)}>
                 {cols.map((c) => (
                   <option key={c} value={c}>{c}</option>
@@ -76,16 +74,21 @@ export default function ChartBuilder({ data }) {
           <button className="ghost" onClick={() => download("svg")}>Download SVG</button>
         </div>
 
-        <img
-          key={src}
-          src={src}
-          alt="chart"
-          className="eda-img"
-          style={{ marginTop: 12, maxWidth: 680 }}
-          hidden={err}
-          onLoad={() => setErr(false)}
-          onError={() => setErr(true)}
-        />
+        <div className="builder-img-wrap" style={{ position: "relative", width: "100%", maxWidth: 680, marginTop: 12 }}>
+          <Image
+            key={src}
+            src={src}
+            alt="chart"
+            width={680}
+            height={450}
+            sizes="(max-width: 768px) 100vw, 680px"
+            className="eda-img"
+            style={{ width: "100%", height: "auto", display: err ? "none" : "block" }}
+            unoptimized
+            onLoad={() => setErr(false)}
+            onError={() => setErr(true)}
+          />
+        </div>
         {err && (
           <p className="target-note" style={{ marginTop: 12 }}>
             Couldn’t render this combination — use a numeric column for histogram / box / violin /
