@@ -206,7 +206,7 @@ function pipelineFromAI(opts, p) {
   };
 }
 
-export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan, onDone }) {
+export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan, onDone, onProceedTraining }) {
   const { info, semType, missPct, feats } = meta(data, target);
   const opts = data.preprocess_options;
   const [steps, setSteps] = useState(() => defaultSteps(data, target));
@@ -431,16 +431,6 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         </div>
       </div>
 
-      {/* Step 5: Run */}
-      <div className="panel" style={{ padding: 16 }}>
-        <p style={{ margin: "0 0 8px", fontSize: 14 }}>
-          Ready when you are. {changedCount > 0 && <b>{changedCount} column(s) changed from the recommendation.</b>}
-        </p>
-        <button className="primary" onClick={apply} disabled={loading}>
-          {loading ? "Running…" : "Run preprocessing"}
-        </button>
-      </div>
-
       {/* Step 3–4: proposed ops per column (the code) + your changes */}
       <p className="pp-cards-title">Per-column operations · change any you like</p>
       <div className="pp-cards">
@@ -579,6 +569,53 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           </a>
         </div>
       )}
+
+      {/* Action Bar at the end of ML Preprocessing */}
+      <div className="preprocess-action-bar clean-action-bar" style={{ marginTop: 28, paddingTop: 20 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <p style={{ margin: 0, fontSize: 14 }}>
+            Ready when you are. {changedCount > 0 && <b>{changedCount} column(s) changed from the recommendation.</b>}
+          </p>
+          {result && (
+            <p className="note" style={{ margin: 0, color: "var(--forge-green, #2d6a4f)", fontWeight: 600 }}>
+              ✓ Preprocessing completed. Training tab is ready.
+            </p>
+          )}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <button
+            id="btn-run-preprocess"
+            type="button"
+            className="primary btn-run-clean"
+            onClick={apply}
+            disabled={loading}
+          >
+            {loading ? (
+              <>
+                <span className="spinner-dot" style={{ marginRight: 6 }}></span>
+                <span>Processing…</span>
+              </>
+            ) : (
+              <span>⚙️ {result ? "Re-run Processing" : "Run Processing"}</span>
+            )}
+          </button>
+
+          {onProceedTraining && (
+            <button
+              id="btn-proceed-training"
+              type="button"
+              className="btn-proceed-audit"
+              onClick={onProceedTraining}
+            >
+              <span>Proceed to Model Training</span>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                <path d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </button>
+          )}
+        </div>
+      </div>
     </section>
   );
 }
