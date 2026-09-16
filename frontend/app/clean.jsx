@@ -50,7 +50,7 @@ function gatherFlags(report) {
   return flags;
 }
 
-export default function Clean({ data, target, plan, planLoading, planErr, onCleaned, onApplyAI }) {
+export default function Clean({ data, target, plan, planLoading, planErr, onCleaned, onApplyAI, onProceedEDA }) {
   const { profile, report, sample } = data;
   const info = profile.columns_info;
   const flags = gatherFlags(report);
@@ -107,6 +107,8 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [summary, setSummary] = useState(null);
+  const [showModal, setShowModal] = useState(false);
+  const [cleanDone, setCleanDone] = useState(false);
 
   function set(col, field, value) {
     setCols((c) => ({ ...c, [col]: { ...c[col], [field]: value } }));
@@ -191,6 +193,15 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
       }
       const fresh = await res.json();
       setSummary(fresh.clean_summary);
+      setCleanDone(true);
+      setShowModal(true);
+      // Reset applied operation selections
+      setDedupe(false);
+      setNullify(false);
+      setDropCols(new Set());
+      setNames({});
+      setValueMaps({});
+      setCols({});
       onCleaned?.(fresh); // downstream tabs (EDA, Preprocess) now use the cleaned data
     } catch (e) {
       setError(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
@@ -283,7 +294,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
         </div>
       </div>
 
-      {/* Global dedupe + placeholders + Run */}
+      {/* Global dedupe + placeholders */}
       <div className="panel" style={{ padding: 16 }}>
         {hasDupes && (
           <label className="pp-check">
@@ -295,26 +306,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
           <input type="checkbox" checked={nullify} onChange={(e) => setNullify(e.target.checked)} />
           Treat common placeholders (N/A, -, ?, none, null, unknown) as missing
         </label>
-        <div style={{ marginTop: 10 }}>
-          <button className="primary" onClick={run} disabled={running}>
-            {running ? "Cleaning…" : "Run clean"}
-          </button>
-        </div>
       </div>
-
-      {error && <div className="error">{error}</div>}
-
-      {summary && (
-        <div className="panel" style={{ marginTop: 12, padding: 16 }}>
-          <b style={{ fontSize: 14 }}>Cleaned. What changed:</b>
-          <ul style={{ margin: "8px 0 0", paddingLeft: 18, fontSize: 13.5, lineHeight: 1.7 }}>
-            {summary.map((s, i) => (
-              <li key={i}>{s.column ? <b>{s.column}: </b> : null}{s.detail}</li>
-            ))}
-          </ul>
-          <p className="note" style={{ marginTop: 8 }}>EDA and Preprocessing now use the cleaned data.</p>
-        </div>
-      )}
 
       {/* Per-column cleaning cards -- trim / merge / retype. Drop is in the panel
           above, but the card shows a drop toggle too for convenience. */}
@@ -391,7 +383,158 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
           </div>
         </>
       ) : (
-        <p className="note" style={{ marginTop: 12 }}>No column-level issues detected. Use the drop panel above to remove any columns you don’t need{hasDupes ? ", or remove duplicates" : ""}.</p>
+        <p className="note" style={{ marginTop: 12 }}>
+          No column-level issues detected. Use the drop panel above to remove any columns you don’t need{hasDupes ? ", or remove duplicates" : ""}.
+        </p>
+      )}
+
+      {/* Error display */}
+      {error && (
+        <div className="error" style={{ marginTop: 16 }}>
+          {error}
+        </div>
+      )}
+
+      {/* Confirmation & Summary of applied clean changes */}
+      {cleanDone && (
+        <div className="clean-success-banner" role="status">
+          <div className="clean-success-icon">✓</div>
+          <div className="clean-success-content">
+            <div className="clean-success-title">Data cleaning done</div>
+            <div className="clean-success-desc">
+              {summary && summary.length > 0
+                ? `${summary.length} cleaning modification(s) applied. You can review the updated preview above, or proceed to visual EDA.`
+                : "Your dataset has been cleaned and re-profiled. Review the cleaned data above or proceed to visual EDA."}
+            </div>
+            {summary && summary.length > 0 && (
+              <details className="clean-details-toggle" style={{ marginTop: 8 }}>
+                <summary style={{ fontSize: 13, cursor: "pointer", color: "var(--cream-accent, #c26e38)", fontWeight: 600 }}>
+                  View details of applied changes ({summary.length})
+                </summary>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13, lineHeight: 1.6 }}>
+                  {summary.map((s, i) => (
+                    <li key={i}>{s.column ? <b>{s.column}: </b> : null}{s.detail}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+          <div className="clean-success-actions">
+            <button
+              type="button"
+              className="ghost"
+              style={{ padding: "8px 14px", fontSize: 13 }}
+              onClick={() => setShowModal(true)}
+            >
+              Summary Modal
+            </button>
+            {onProceedEDA && (
+              <button
+                type="button"
+                className="btn-proceed-audit"
+                style={{ padding: "8px 16px", fontSize: 13 }}
+                onClick={onProceedEDA}
+              >
+                <span>Proceed to visual EDA</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                  <path d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Action Bar at the end of Data Cleaning */}
+      <div className="clean-action-bar">
+        <button
+          id="btn-run-clean"
+          type="button"
+          className="primary btn-run-clean"
+          onClick={run}
+          disabled={running}
+        >
+          {running ? (
+            <>
+              <span className="spinner-dot" style={{ marginRight: 6 }}></span>
+              <span>Cleaning…</span>
+            </>
+          ) : (
+            <span>🧹 Run clean</span>
+          )}
+        </button>
+
+        {onProceedEDA && (
+          <button
+            id="btn-proceed-eda"
+            type="button"
+            className="btn-proceed-audit"
+            onClick={onProceedEDA}
+          >
+            <span>Proceed to visual EDA</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path d="M5 12h14M12 5l7 7-7 7" />
+            </svg>
+          </button>
+        )}
+      </div>
+
+      {/* Confirmation Popup Modal */}
+      {showModal && (
+        <div className="modal-backdrop" onClick={() => setShowModal(false)}>
+          <div className="modal-dialog" onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              className="modal-close-btn"
+              onClick={() => setShowModal(false)}
+              aria-label="Close modal"
+            >
+              ✕
+            </button>
+
+            <div className="modal-icon-badge">✓</div>
+            <h3 className="modal-title">Data cleaning done!</h3>
+            <p className="modal-subtitle">
+              Your dataset has been cleaned and re-profiled. Review the applied changes or proceed when you’re ready.
+            </p>
+
+            {summary && summary.length > 0 && (
+              <div className="modal-summary-box">
+                <b style={{ fontSize: 13, display: "block", marginBottom: 6 }}>Applied Modifications:</b>
+                <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, lineHeight: 1.6 }}>
+                  {summary.map((s, i) => (
+                    <li key={i}>{s.column ? <b>{s.column}: </b> : null}{s.detail}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => setShowModal(false)}
+              >
+                Review Cleaned Data
+              </button>
+              {onProceedEDA && (
+                <button
+                  type="button"
+                  className="btn-proceed-audit"
+                  onClick={() => {
+                    setShowModal(false);
+                    onProceedEDA();
+                  }}
+                >
+                  <span>Proceed to visual EDA</span>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </section>
   );

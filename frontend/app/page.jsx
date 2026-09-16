@@ -229,14 +229,6 @@ export default function Page() {
         </nav>
 
         <div className="sidebar-footer">
-          <div className="sidebar-profile-card">
-            <div className="profile-avatar">👤</div>
-            <div className="profile-meta">
-              <span className="profile-name">ML Workspace</span>
-              <span className="profile-status">● Session Active</span>
-            </div>
-          </div>
-
           <button
             type="button"
             className="btn-sidebar-back"
@@ -300,10 +292,19 @@ export default function Page() {
                 <span className="chip-count">({result.profile?.rows} rows)</span>
               </div>
             )}
-            <div className="server-status-pill">
-              <span className="status-dot"></span>
-              <span>Local API (8000)</span>
-            </div>
+            {result && target && (
+              <div
+                className="loaded-dataset-chip"
+                style={{ cursor: "pointer", borderColor: "rgba(194, 110, 56, 0.4)" }}
+                onClick={() => {
+                  setActiveTab("insights");
+                  window.scrollTo({ top: 0, behavior: "smooth" });
+                }}
+                title="Click to view or edit target in Quality Audit"
+              >
+                <span>🎯 <b>{target}</b></span>
+              </div>
+            )}
           </div>
         </header>
 
@@ -415,7 +416,7 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
   function onCleaned(fresh) {
     setData(fresh);
     setRev((r) => r + 1);
-    setTab("eda");
+    // User remains on the Data Cleaning page to review results and decides when to move on
   }
 
   const { score, grade, deductions } = report.quality_score;
@@ -448,10 +449,6 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
       <div className="report-row">
         <div className="report-main">
 
-      {/* Target: the user's choice, always visible -- it drives the AI plan,
-          the chat, and preprocessing. */}
-      <TargetPicker data={data} target={target} setTarget={setTarget} />
-
       {/* Tabs — flow order: audit -> clean -> explore -> preprocess */}
       <div className="tabs">
         <button className={tab === "insights" ? "tab on" : "tab"} onClick={() => setTab("insights")}>
@@ -474,8 +471,49 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
         </button>
       </div>
 
+      {/* Compact active target indicator for downstream tabs */}
+      {tab !== "insights" && target && (
+        <div
+          className="target-compact-bar"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            background: "var(--cream-card-subtle, #F5EFE6)",
+            border: "1px solid var(--cream-border, #E8DFD1)",
+            borderRadius: "10px",
+            padding: "8px 14px",
+            marginBottom: "14px",
+            fontSize: "13px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <span style={{ fontSize: "14px" }}>🎯</span>
+            <span>
+              Target column: <strong style={{ color: "var(--cream-accent, #C26E38)" }}>{target}</strong>
+              <span className="tag" style={{ marginLeft: "8px", textTransform: "capitalize", fontSize: "11px", padding: "1px 6px" }}>
+                {task || (info[target]?.type === "numeric" ? "regression" : "classification")}
+              </span>
+            </span>
+          </div>
+          <button
+            type="button"
+            className="pp-link"
+            style={{ fontSize: "12.5px", cursor: "pointer", background: "none", border: "none" }}
+            onClick={() => {
+              setTab("insights");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
+          >
+            Change target in Audit
+          </button>
+        </div>
+      )}
+
       {/* ===== INSIGHTS TAB ===== */}
       <div hidden={tab !== "insights"}>
+        {/* Target: selected during Quality Audit to guide cleaning, EDA, and preprocessing */}
+        <TargetPicker data={data} target={target} setTarget={setTarget} />
 
       {/* Summary */}
       <section>
@@ -687,18 +725,40 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
           <pre>{JSON.stringify(data, null, 2)}</pre>
         </details>
       </Section>
+
+      {/* Action Bar Footer */}
+      <div className="preview-action-bar" style={{ marginTop: 28, paddingTop: 16 }}>
+        <button
+          id="btn-proceed-cleaning"
+          type="button"
+          className="btn-proceed-audit"
+          onClick={() => {
+            setTab("cleaning");
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+        >
+          <span>Proceed to data cleaning</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+            <path d="M5 12h14M12 5l7 7-7 7" />
+          </svg>
+        </button>
+      </div>
       </div>
 
       {/* ===== CLEANING TAB ===== */}
       <div hidden={tab !== "cleaning"}>
         <Clean
-          key={"clean:" + rev}
+          key={"clean:" + data.id}
           data={data}
           target={target}
           plan={plan?.clean}
           planLoading={planLoading}
           planErr={planErr}
           onCleaned={onCleaned}
+          onProceedEDA={() => {
+            setTab("eda");
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
         />
       </div>
 
@@ -707,6 +767,34 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
         <Charts data={data} />
         <EdaGallery data={data} />
         <ChartBuilder data={data} />
+
+        {/* Action Bar at the end of Visual EDA */}
+        <div
+          className="eda-action-bar preview-action-bar"
+          style={{
+            marginTop: 32,
+            paddingTop: 20,
+            borderTop: "1px solid var(--cream-border)",
+            display: "flex",
+            justifyContent: "flex-end",
+            alignItems: "center",
+          }}
+        >
+          <button
+            id="btn-proceed-processing"
+            type="button"
+            className="btn-proceed-audit"
+            onClick={() => {
+              setTab("preprocessing");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
+          >
+            <span>Proceed Processing</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path d="M5 12h14M12 5l7 7-7 7" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* ===== PREPROCESSING TAB ===== */}
@@ -722,6 +810,10 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
           planErr={planErr}
           onPlan={setLivePlan}
           onDone={() => setPrepRev((r) => r + 1)}
+          onProceedTraining={() => {
+            setTab("training");
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
         />
       </div>
 
