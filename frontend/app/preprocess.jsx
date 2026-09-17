@@ -259,6 +259,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   function setStep(col, field, value) {
     setSteps((s) => ({ ...s, [col]: { ...s[col], [field]: value } }));
   }
+  const textCols = feats.filter((c) => steps[c]?.encode === "text");
   const hasAiPipeline = aiPipeline && Object.keys(aiPipeline).length > 0;
   function applyAI() {
     if (!plan) return;
@@ -433,6 +434,19 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
 
       {/* Step 3–4: proposed ops per column (the code) + your changes */}
       <p className="pp-cards-title">Per-column operations · change any you like</p>
+      {/* Text columns behave differently from every other column: they stay text in the
+          export and become word/letter features at training. Say so once, up front. */}
+      {textCols.length > 0 && (
+        <div className="panel" style={{ padding: 12, marginBottom: 10 }}>
+          <b>Text → TF-IDF:</b>{" "}
+          {textCols.map((c, i) => <span key={c}>{i ? ", " : ""}<code>{c}</code></span>)}
+          <p className="note" style={{ margin: "4px 0 0" }}>
+            These stay as readable text in the cleaned file. At training each is turned into word
+            (1–2) and letter (3–5) TF-IDF features, learned on the training split only and saved in
+            the pipeline. Change a column&apos;s <i>Encode</i> to something else if that is not what you want.
+          </p>
+        </div>
+      )}
       <div className="pp-cards">
         {feats.map((col) => {
           const numeric = semType[col] === "numeric";
@@ -445,6 +459,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
               <div className="pp-card-head">
                 <span className="pp-card-name" title={col}>{col}</span>
                 <span className="tag">{semType[col]}</span>
+                {step.encode === "text" && <span className="tag">→ TF-IDF</span>}
                 {changed && <span className="pp-changed">changed</span>}
               </div>
 

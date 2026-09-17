@@ -31,6 +31,7 @@ def detect_missing_values(df, detect_empty_strings=True):
 
     total_rows = len(df)
     columns_with_missing = []
+    row_has_missing = pd.Series(False, index=df.index)
 
     for column in df.columns:
         series = df[column]
@@ -39,6 +40,7 @@ def detect_missing_values(df, detect_empty_strings=True):
         # truth so this count can't drift from the profiler's missing_percent.
         esm = empty_string_mask(series) if detect_empty_strings else pd.Series(False, index=series.index)
         missing = null_mask | esm
+        row_has_missing |= missing          # any missing cell marks the whole row
         missing_count = int(missing.sum())
 
         if missing_count > 0:
@@ -64,6 +66,8 @@ def detect_missing_values(df, detect_empty_strings=True):
             "total_columns": len(df.columns),
             "columns_with_missing": len(columns_with_missing),
             "total_missing_cells": total_missing_cells,
+            # rows with at least one missing cell -- what "drop rows with missing values" removes
+            "rows_with_missing": int(row_has_missing.sum()),
         },
         "columns": columns_with_missing,
     }

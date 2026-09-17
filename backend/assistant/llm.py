@@ -292,6 +292,10 @@ Allowed CLEAN ops (applied to the whole table):
   {"op":"rename_column","column":C,"to":"clean_name"}      # tidy a messy header: "Age (yrs)" -> "age"
   {"op":"drop_column","column":C}
   {"op":"drop_duplicates"}
+  {"op":"drop_missing_rows"}                               # drop rows with any missing value; add
+                                                           # "columns":[C,...] to check only those columns.
+                                                           # Suggest it only when few rows are affected --
+                                                           # imputing keeps more data.
 Allowed PREPROCESS ops (per column, fit on train):
   {"op":"impute","strategy":"mean"|"median"|"most_frequent"|"constant"}
   {"op":"encode","method":"onehot"|"ordinal"|"text"}           # text = kept raw, word+letter tf-idf fit at training
