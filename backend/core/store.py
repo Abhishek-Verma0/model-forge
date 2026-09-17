@@ -70,7 +70,27 @@ def create(df, filename):
     _dir(ds_id).mkdir(parents=True)
     write_json(_dir(ds_id) / "meta.json", {"filename": filename, "created": time.time(), "clean_ops": []})
     save_frame(ds_id, df)
+    df.to_pickle(_dir(ds_id) / "original.pkl")   # never overwritten: what "reset" restores
     return ds_id
+
+
+def has_original(ds_id):
+    return (_dir(ds_id) / "original.pkl").exists()
+
+
+def reset_frame(ds_id):
+    """Undo every cleaning step: restore the uploaded table and forget the ops.
+    Returns the restored frame, or None when the dataset predates this copy."""
+    path = _dir(ds_id) / "original.pkl"
+    if not path.exists():
+        return None
+    df = pd.read_pickle(path)
+    save_frame(ds_id, df)
+    with _lock:
+        m = meta(ds_id) or {}
+        m["clean_ops"] = []
+        write_json(_dir(ds_id) / "meta.json", m)
+    return df
 
 
 def save_frame(ds_id, df):
