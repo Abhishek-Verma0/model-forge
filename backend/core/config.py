@@ -89,6 +89,16 @@ STORE_CAP = int(os.getenv("STORE_CAP", 5))
 # deployment setting (disk location), not an analysis one.
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent.parent / "data"))
 
+# Database & Authentication
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://postgres:postgres@localhost:5432/modelforge"
+)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "modelforge_jwt_secret_dev_key_92837482910")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))  # 7 days
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+
 
 def dataset_path():
     """The dataset to work on: CLI argument first, then $DATASET_PATH."""

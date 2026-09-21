@@ -11,8 +11,11 @@ Run from backend/: uvicorn app:app --reload --port 8000
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api import assistant, data, inference, training
-from core import config, jobs
+from api import assistant, auth, data, inference, training
+from core import config, database, jobs
+
+# Initialize database tables (User, etc.)
+database.init_db()
 
 app = FastAPI(title="ResearchAI Studio API")
 app.add_middleware(
@@ -21,6 +24,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth.router)
 app.include_router(data.router)
 app.include_router(training.router)
 app.include_router(inference.router)

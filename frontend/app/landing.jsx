@@ -1,8 +1,19 @@
 "use client";
 
 import { useState } from "react";
+import { useAuth } from "./authcontext";
 
 export default function Landing({ onLaunchStudio }) {
+  const { user, openAuthModal, logout } = useAuth();
+
+  function handleLaunch() {
+    if (!user) {
+      openAuthModal("register");
+    } else {
+      onLaunchStudio();
+    }
+  }
+
   return (
     <div className="landing-root">
       {/* Top Navbar */}
@@ -30,18 +41,56 @@ export default function Landing({ onLaunchStudio }) {
             <a href="#features" className="nav-link">About</a>
           </nav>
 
-          <div className="landing-nav-cta">
-            <button
-              id="btn-get-started"
-              type="button"
-              className="btn-cream-primary"
-              onClick={onLaunchStudio}
-            >
-              <span>Get Started</span>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                <path d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
-            </button>
+          <div className="landing-nav-cta" style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            {user ? (
+              <>
+                <div className="user-nav-profile">
+                  <div className="user-avatar-circle">
+                    {user.avatar_url ? (
+                      <img src={user.avatar_url} alt={user.full_name || user.email} />
+                    ) : (
+                      <span>{(user.full_name || user.email || "U")[0].toUpperCase()}</span>
+                    )}
+                  </div>
+                  <span className="user-nav-name">{user.full_name || user.email.split("@")[0]}</span>
+                  <button type="button" className="btn-sign-out" onClick={logout} title="Sign Out">
+                    Sign Out
+                  </button>
+                </div>
+                <button
+                  id="btn-get-started"
+                  type="button"
+                  className="btn-cream-primary"
+                  onClick={onLaunchStudio}
+                >
+                  <span>Open Studio</span>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="btn-nav-signin"
+                  onClick={() => openAuthModal("login")}
+                >
+                  Sign In
+                </button>
+                <button
+                  id="btn-get-started"
+                  type="button"
+                  className="btn-cream-primary"
+                  onClick={() => openAuthModal("register")}
+                >
+                  <span>Get Started</span>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -72,7 +121,7 @@ export default function Landing({ onLaunchStudio }) {
                 id="btn-launch-studio"
                 type="button"
                 className="btn-hero-primary"
-                onClick={onLaunchStudio}
+                onClick={handleLaunch}
               >
                 <span>Launch Studio</span>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
@@ -404,7 +453,7 @@ export default function Landing({ onLaunchStudio }) {
         <div className="cta-banner-inner">
           <h2>Ready to Forge Your Next Dataset?</h2>
           <p>Launch the studio, drop your CSV or Excel file, and audit your data quality in seconds.</p>
-          <button className="btn-hero-primary" onClick={onLaunchStudio}>
+          <button className="btn-hero-primary" onClick={handleLaunch}>
             <span>Launch Model Forge Studio</span>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
               <path d="M5 12h14M12 5l7 7-7 7" />

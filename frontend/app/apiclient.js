@@ -2,11 +2,24 @@
 export const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export async function call(path, body, method) {
-  const init = body instanceof FormData
-    ? { method: "POST", body }
-    : body !== undefined
-      ? { method: method || "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-      : method ? { method } : undefined;
+  const token = typeof window !== "undefined" ? localStorage.getItem("modelforge_token") : null;
+  const headers = {};
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  let init;
+  if (body instanceof FormData) {
+    init = { method: method || "POST", headers, body };
+  } else if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init = { method: method || "POST", headers, body: JSON.stringify(body) };
+  } else if (method) {
+    init = { method, headers };
+  } else if (token) {
+    init = { headers };
+  }
+
   let res;
   try {
     res = await fetch(`${API}${path}`, init);
