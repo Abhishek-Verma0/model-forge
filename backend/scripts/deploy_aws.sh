@@ -35,7 +35,14 @@ git fetch --all
 git checkout newbranch 2>/dev/null || git checkout main 2>/dev/null || true
 git pull || true
 
-# 4. Virtual environment & ML dependencies
+# 4. Configure PostgreSQL
+echo "--> Configuring PostgreSQL database..."
+sudo -u postgres psql << 'SQL' || true
+ALTER USER postgres WITH PASSWORD 'postgres';
+CREATE DATABASE modelforge;
+SQL
+
+# 5. Virtual environment & ML dependencies
 echo "--> Setting up Python environment..."
 cd /home/ubuntu/model-forge/backend
 python3 -m venv .venv
@@ -43,9 +50,12 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 5. Setup default .env if missing
-if [ ! -f .env ]; then
-  echo "--> Initializing .env file..."
+# 6. Setup .env file
+if [ -f /home/ubuntu/.env.production ]; then
+  echo "--> Applying production .env configuration..."
+  cp /home/ubuntu/.env.production .env
+elif [ ! -f .env ]; then
+  echo "--> Initializing default .env file..."
   cp .env.example .env
 fi
 
