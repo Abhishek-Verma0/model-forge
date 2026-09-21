@@ -14,6 +14,8 @@ import Landing from "./landing";
 import DatasetUpload from "./upload";
 import DatasetPreview from "./preview";
 import { API } from "./apiclient";
+import { AuthProvider, useAuth } from "./authcontext";
+import AuthModal from "./authmodal";
 
 // What each detected issue means for preprocessing. Read-only for now — the
 // backend has no "apply" endpoint yet, so these are recommendations, not buttons.
@@ -38,7 +40,8 @@ const VALUE_ISSUE_LABEL = {
 const num = (v) =>
   typeof v === "number" ? v.toLocaleString(undefined, { maximumFractionDigits: 3 }) : v ?? "—";
 
-export default function Page() {
+function StudioApp() {
+  const { user, logout, openAuthModal, isLoading } = useAuth();
   const [viewMode, setViewMode] = useState("landing");
   const [activeTab, setActiveTab] = useState("upload");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -55,6 +58,14 @@ export default function Page() {
   useEffect(() => {
     fetch(`${API}/api/upload/limits`).then((r) => (r.ok ? r.json() : null)).then(setLimits).catch(() => {});
   }, []);
+
+  // Enforce mandatory registration/login for accessing the studio
+  useEffect(() => {
+    if (!isLoading && !user && viewMode === "studio") {
+      setViewMode("landing");
+      openAuthModal("login");
+    }
+  }, [user, isLoading, viewMode, openAuthModal]);
 
   function pick(f) {
     setError("");
@@ -120,7 +131,20 @@ export default function Page() {
   }
 
   if (viewMode === "landing") {
-    return <Landing onLaunchStudio={() => setViewMode("studio")} />;
+    return (
+      <>
+        <Landing
+          onLaunchStudio={() => {
+            if (!user) {
+              openAuthModal("register");
+            } else {
+              setViewMode("studio");
+            }
+          }}
+        />
+        <AuthModal />
+      </>
+    );
   }
 
   return (
@@ -305,6 +329,31 @@ export default function Page() {
                 <span>🎯 <b>{target}</b></span>
               </div>
             )}
+            {user && (
+              <div className="user-nav-profile" style={{ marginLeft: "6px" }}>
+                <div className="user-avatar-circle" style={{ width: "24px", height: "24px", fontSize: "11px" }}>
+                  {user.avatar_url ? (
+                    <img src={user.avatar_url} alt={user.full_name || user.email} />
+                  ) : (
+                    <span>{(user.full_name || user.email || "U")[0].toUpperCase()}</span>
+                  )}
+                </div>
+                <span className="user-nav-name" style={{ fontSize: "12px", maxWidth: "110px" }}>
+                  {user.full_name || user.email.split("@")[0]}
+                </span>
+                <button
+                  type="button"
+                  className="btn-sign-out"
+                  onClick={() => {
+                    logout();
+                    setViewMode("landing");
+                  }}
+                  title="Sign Out"
+                >
+                  Sign Out
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
@@ -347,6 +396,7 @@ export default function Page() {
           )}
         </div>
       </main>
+      <AuthModal />
     </div>
   );
 }
@@ -908,4 +958,12 @@ function issueDetail(key, checks) {
     default:
       return "";
   }
+}
+
+export default function Page() {
+  return (
+    <AuthProvider>
+      <StudioApp />
+    </AuthProvider>
+  );
 }
