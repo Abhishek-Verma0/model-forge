@@ -48,7 +48,11 @@ cd /home/ubuntu/model-forge/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+
+# Use disk for temporary build files instead of small 450MB /tmp tmpfs
+mkdir -p /home/ubuntu/tmp
+export TMPDIR=/home/ubuntu/tmp
+pip install --no-cache-dir -r requirements.txt
 
 # 6. Setup .env file
 if [ -f /home/ubuntu/.env.production ]; then
