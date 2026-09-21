@@ -29,6 +29,13 @@ res = D.do_preprocess({"id": ds, "target": "y", "task": "classification",
                        "columns": {"review": [{"op": "encode", "method": "text"}]}})
 assert "fitted" not in res and "csv" not in res and res["train_rows"] == 32, res.keys()
 
+# reset undoes every cleaning step and restores the uploaded table
+assert cleaned["can_reset"] is True
+back = D.reset_clean({"id": ds})
+pd.testing.assert_frame_equal(store.load_frame(ds), df)
+assert store.clean_ops(ds) == [] and back["can_reset"] is True
+D.do_clean({"id": ds, "ops": [{"op": "trim_whitespace", "column": "review"}]})   # clean again for the rest
+
 store._cache.clear()                                       # restart: memory gone, disk remains
 assert D.download(ds).body.startswith(b"review")
 fitted = joblib.load(io.BytesIO(D.download_pipeline(ds).body))

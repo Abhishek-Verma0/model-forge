@@ -397,7 +397,7 @@ def transform(fitted, df):
     step with its train-fitted values. Training-only row steps (dedupe, drop rows,
     outlier row removal, resampling) are skipped -- you can't drop a row you
     were asked to predict."""
-    ops = [o for o in fitted["clean_ops"] if o["op"] != "drop_duplicates"]
+    ops = [o for o in fitted["clean_ops"] if o["op"] not in clean.ROW_OPS]  # new rows are never dropped
     if ops:
         df, _ = clean.apply_clean(df, ops)
     X = df[fitted["features"]].copy()
@@ -550,6 +550,14 @@ if __name__ == "__main__":
     replayed = transform(fitted, raw_te.drop(columns=["y"]))
     replayed = pd.read_csv(io.StringIO(replayed.to_csv(index=False)))    # same text round trip as the CSV
     pd.testing.assert_frame_equal(replayed, test_out, check_dtype=False)
+
+    # row ops recorded at cleaning time (dedupe, drop rows with missing values) must NOT
+    # run again on new rows -- predicting returns one row per row given
+    with_row_ops = dict(fitted, clean_ops=clean_ops + [{"op": "drop_duplicates"}, {"op": "drop_missing_rows"}])
+    new_rows = raw.drop(columns=["y"]).head(10).copy()
+    new_rows.iloc[0, new_rows.columns.get_loc("age")] = None      # a row that cleaning would have dropped
+    new_rows.iloc[1] = new_rows.iloc[2]                           # and a duplicate row
+    assert len(transform(with_row_ops, new_rows)) == len(new_rows), "predicting must never drop rows"
 
     train_out = out[out["__split__"] == "train"]
     X_tr = to_matrix(fitted, train_out.drop(columns=["y", "__split__"]))

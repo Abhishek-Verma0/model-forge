@@ -5,23 +5,30 @@ transforms (impute / scale / encode / outliers) live in execute.py and run after
 the split.
 
 Operations are a fixed, validated allowlist -- the LLM SELECTS from it, it never
-supplies code. ops is an ORDERED list; each is column-scoped except
-drop_duplicates which is dataset-level:
+supplies code. ops is an ORDERED list; each is column-scoped except the row ops
+(ROW_OPS), which act on whole rows of the dataset:
 
   [{"op":"trim_whitespace","column":"name"},
    {"op":"merge_categories","column":"sex","mapping":{"male":"Male"}},  # or omit mapping = trim+lower
    {"op":"retype","column":"amount","to":"number"},   # to = number | datetime | category
    {"op":"map_values","column":"grade","mapping":{"A":"1"}},
    {"op":"drop_column","column":"notes"},
-   {"op":"drop_duplicates"}]
+   {"op":"drop_duplicates"},
+   {"op":"drop_missing_rows"},                       # any column; or "columns": ["age"] for some
+  ]
+
+Row ops drop rows, so they are applied to the dataset being prepared and SKIPPED when
+the saved pipeline is replayed on new rows (execute.transform) -- predicting must return
+one row per row given, never fewer.
 """
 
 import pandas as pd
 
-from preprocessing.profiler import is_numeric
+from preprocessing.profiler import empty_string_mask, is_numeric
 
+ROW_OPS = {"drop_duplicates", "drop_missing_rows"}   # drop whole rows; never replayed on new rows
 _CLEAN_OPS = {"trim_whitespace", "merge_categories", "retype", "map_values", "nullify",
-              "rename_column", "drop_column", "drop_duplicates"}
+              "rename_column", "drop_column"} | ROW_OPS
 _RETYPE = {"number", "datetime", "category"}
 # Textual placeholders that mean "missing" but read as real values. Numeric
 # sentinels (999, -1) are dataset-specific -- NOT auto-nullified (would corrupt data).
@@ -37,8 +44,12 @@ def _validate(op):
     name = op.get("op")
     if name not in _CLEAN_OPS:
         raise ValueError(f"Unknown clean op '{name}'. Allowed: {sorted(_CLEAN_OPS)}")
-    if name != "drop_duplicates" and not op.get("column"):
+    if name not in ROW_OPS and not op.get("column"):
         raise ValueError(f"clean op '{name}' needs a column.")
+    if name == "drop_missing_rows":
+        missing = [c for c in (op.get("columns") or []) if not str(c).strip()]
+        if missing:
+            raise ValueError("drop_missing_rows.columns must be non-empty column names.")
     if name == "retype" and op.get("to", "number") not in _RETYPE:
         raise ValueError(f"retype.to must be one of {sorted(_RETYPE)}")
     if name == "rename_column" and not str(op.get("to", "")).strip():
@@ -60,10 +71,25 @@ def apply_clean(df, ops):
             summary.append({"op": "drop_duplicates", "detail": f"{before - len(df)} duplicate rows removed"})
             continue
 
+        if name == "drop_missing_rows":
+            # "missing" means the same here as in the audit: nulls AND blank strings
+            cols = [c for c in (op.get("columns") or df.columns) if c in df.columns]
+            before = len(df)
+            missing = pd.Series(False, index=df.index)
+            for c in cols:
+                missing |= df[c].isnull() | empty_string_mask(df[c])
+            df = df[~missing]
+            where = "any column" if not op.get("columns") else ", ".join(cols)
+            summary.append({"op": "drop_missing_rows",
+                            "detail": f"{before - len(df)} rows with missing values removed ({where})"})
+            continue
+
         col = op["column"]
         if col not in df.columns:
             continue  # already dropped by an earlier op, or a stale plan entry
         before_dtype = str(df[col].dtype)
+        before_values = int(df[col].nunique(dropna=True))
+        before_missing = int(df[col].isna().sum())
 
         if name == "trim_whitespace":
             df[col] = df[col].astype("string").str.strip()
@@ -110,8 +136,18 @@ def apply_clean(df, ops):
             summary.append({"op": name, "column": col, "detail": "column dropped"})
             continue
 
-        summary.append({"op": name, "column": col,
-                        "detail": f"{before_dtype} -> {df[col].dtype}"})
+        # say what actually changed: merged spellings show as fewer distinct values,
+        # a retype shows as a new dtype, a failed retype as new missing cells
+        after_values, after_dtype = int(df[col].nunique(dropna=True)), str(df[col].dtype)
+        bits = []
+        if after_values != before_values:
+            bits.append(f"{before_values} distinct values -> {after_values}")
+        if after_dtype != before_dtype:
+            bits.append(f"{before_dtype} -> {after_dtype}")
+        new_missing = int(df[col].isna().sum()) - before_missing
+        if new_missing > 0:   # e.g. a "convert to number" that could not parse some values
+            bits.append(f"{new_missing} value(s) could not be converted and are now missing")
+        summary.append({"op": name, "column": col, "detail": ", ".join(bits) or "no change"})
     return df, summary
 
 
@@ -144,4 +180,24 @@ if __name__ == "__main__":
         raise AssertionError("collision rename should have raised")
     except ValueError:
         pass
+
+    # row ops: duplicates and rows with missing values (blank strings count as missing,
+    # and "missing" here must mean what the audit reported)
+    rows = pd.DataFrame({"a": [1, 1, 2, None, 4], "b": ["x", "x", "", "y", "z"]})
+    from preprocessing.detector import detect_missing_values
+    reported = detect_missing_values(rows)["summary"]["rows_with_missing"]
+    dropped, summ_rows = apply_clean(rows, [{"op": "drop_missing_rows"}])
+    assert len(dropped) == len(rows) - reported == 3, (len(dropped), reported)
+    assert apply_clean(rows, [{"op": "drop_missing_rows", "columns": ["a"]}])[0].shape[0] == 4  # only column a
+    assert len(apply_clean(rows, [{"op": "drop_duplicates"}])[0]) == 4
+    assert "2 rows with missing values removed (any column)" in summ_rows[0]["detail"], summ_rows
+    assert set(ROW_OPS) <= _CLEAN_OPS and "drop_missing_rows" in ROW_OPS
+
+    # the summary must say what changed, not just the dtype
+    spellings = pd.DataFrame({"sex": ["Male", "male", " Male", "female", "Female "],
+                              "amt": ["1,200", "oops", "900", "50", "1,000"]})
+    _, s2 = apply_clean(spellings, [{"op": "merge_categories", "column": "sex"},
+                                    {"op": "retype", "column": "amt", "to": "number"}])
+    assert "5 distinct values -> 2" in s2[0]["detail"], s2[0]
+    assert "could not be converted" in s2[1]["detail"] and "-> Int64" in s2[1]["detail"], s2[1]
     print("clean self-check passed:", [s["detail"] for s in summ])

@@ -29,7 +29,8 @@ def _payload(df, filename, ds_id):
             "charts": chart_data(df),
             "eda": render_charts(df),
             "sample": json.loads(df.head(50).to_json(orient="records")),
-            "preprocess_options": execute.options()}
+            "preprocess_options": execute.options(),
+            "can_reset": store.has_original(ds_id)}
 
 
 @router.get("/api/upload/limits")
@@ -71,6 +72,17 @@ def do_clean(payload: dict = Body(...)):
     out = _payload(cleaned, payload.get("filename", "cleaned"), payload["id"])
     out["clean_summary"] = summary
     return out
+
+
+@router.post("/api/clean/reset")
+def reset_clean(payload: dict = Body(...)):
+    """Undo all cleaning: restore the uploaded table. Body: {id}."""
+    ds_id = payload.get("id")
+    frame_or_404(ds_id)
+    df = store.reset_frame(ds_id)
+    if df is None:
+        raise HTTPException(404, "No original copy for this dataset (uploaded before reset existed).")
+    return _payload(df, payload.get("filename", "original"), ds_id)
 
 
 @router.post("/api/preprocess")

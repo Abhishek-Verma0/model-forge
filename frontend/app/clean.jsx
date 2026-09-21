@@ -14,6 +14,7 @@ function readableClean(o) {
   if (o.op === "nullify") return "treat placeholders as missing";
   if (o.op === "map_values") return "relabel values";
   if (o.op === "drop_column") return "drop this column";
+  if (o.op === "drop_missing_rows") return "remove rows with missing values";
   return o.op;
 }
 
@@ -55,6 +56,15 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
   const info = profile.columns_info;
   const flags = gatherFlags(report);
   const hasDupes = report.checks.duplicate_rows.has_duplicates;
+  // column -> the spelling groups "Merge inconsistent categories" would join (audit output)
+  const mergeGroups = {};
+  for (const c of report.checks.consistency_issues.columns) {
+    const groups = Object.entries(c.examples || {});
+    if (groups.length) mergeGroups[c.column] = { groups, more: Math.max(0, c.inconsistent_groups - groups.length) };
+  }
+  const dupeRows = report.checks.duplicate_rows.summary.duplicate_rows;
+  const totalRows = report.checks.missing_values.summary.total_rows;
+  const missingRows = report.checks.missing_values.summary.rows_with_missing ?? 0;
   const allCols = profile.column_names;
 
   const semType = {};
@@ -73,7 +83,10 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
   const aiDrops = [];
   const aiNames = {}; // col -> AI-suggested new name (shown as a hint until applied)
   for (const o of plan || []) {
-    if (o.op === "drop_duplicates") { if (o.note) aiGlobal.push(o.note); continue; }
+    if (o.op === "drop_duplicates" || o.op === "drop_missing_rows") {   // whole-row ops: no column card
+      if (o.note) aiGlobal.push(o.note);
+      continue;
+    }
     const col = o.column;
     if (!col) continue;
     aiByCol[col] = aiByCol[col] || { actions: [], notes: [] };
@@ -100,6 +113,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
 
   const [dedupe, setDedupe] = useState(hasDupes);
   const [nullify, setNullify] = useState(false);
+  const [dropNullRows, setDropNullRows] = useState(false); // off by default: dropping rows loses data
   const [cols, setCols] = useState(init);
   const [dropCols, setDropCols] = useState(seedDrops);
   const [names, setNames] = useState({}); // col -> new name (only when changed from original)
@@ -129,6 +143,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
     const nextNames = { ...names };
     for (const o of plan) {
       if (o.op === "drop_duplicates") { setDedupe(true); continue; }
+      if (o.op === "drop_missing_rows") { setDropNullRows(true); continue; }
       if (o.op === "nullify") { setNullify(true); continue; }
       const col = o.column;
       if (!col) continue;
@@ -150,6 +165,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
     if (dedupe) ops.push({ op: "drop_duplicates" });
     // nullify runs first so the placeholders it clears count as missing downstream.
     if (nullify) for (const col of allCols) if (!dropCols.has(col)) ops.push({ op: "nullify", column: col });
+    if (dropNullRows) ops.push({ op: "drop_missing_rows" });   // after nullify: placeholders count as missing
     for (const col of dropCols) ops.push({ op: "drop_column", column: col });
     for (const col of shown) {
       if (dropCols.has(col)) continue; // dropped -> its fix ops are moot
@@ -171,6 +187,25 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
       if (nm && nm !== col) ops.push({ op: "rename_column", column: col, to: nm });
     }
     return ops;
+  }
+
+  async function reset() {
+    if (!confirm("Undo all cleaning and restore the uploaded data?")) return;
+    setRunning(true); setError(""); setSummary(null);
+    try {
+      const res = await fetch(`${API}/api/clean/reset`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: data.id, filename: data.filename }),
+      });
+      if (!res.ok) {
+        let d = `Error ${res.status}`;
+        try { const j = await res.json(); if (j.detail) d = j.detail; } catch {}
+        throw new Error(d);
+      }
+      onCleaned(await res.json());   // same path as a clean: re-profile and re-render everything
+    } catch (e) {
+      setError(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
+    } finally { setRunning(false); }
   }
 
   async function run() {
@@ -294,18 +329,31 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
         </div>
       </div>
 
-      {/* Global dedupe + placeholders */}
+      {/* Whole-row cleaning + placeholders. Both row options are ALWAYS listed, disabled
+          with a count of 0, so it is clear they exist and were checked. */}
       <div className="panel" style={{ padding: 16 }}>
-        {hasDupes && (
-          <label className="pp-check">
-            <input type="checkbox" checked={dedupe} onChange={(e) => setDedupe(e.target.checked)} />
-            Remove {report.checks.duplicate_rows.summary.duplicate_rows.toLocaleString()} duplicate rows
-          </label>
-        )}
+        <label className="pp-check">
+          <input type="checkbox" checked={dedupe} disabled={!dupeRows} onChange={(e) => setDedupe(e.target.checked)} />
+          Remove duplicate rows <span className="note">({dupeRows ? `${dupeRows.toLocaleString()} found` : "none found"})</span>
+        </label>
+        <label className="pp-check">
+          <input type="checkbox" checked={dropNullRows} disabled={!missingRows}
+                 onChange={(e) => setDropNullRows(e.target.checked)} />
+          Remove rows with missing values{" "}
+          <span className="note">
+            ({missingRows ? `${missingRows.toLocaleString()} of ${totalRows.toLocaleString()} rows` : "none found"}
+            {missingRows ? `, ${Math.round((missingRows / totalRows) * 100)}% of your data` : ""})
+          </span>
+        </label>
         <label className="pp-check">
           <input type="checkbox" checked={nullify} onChange={(e) => setNullify(e.target.checked)} />
           Treat common placeholders (N/A, -, ?, none, null, unknown) as missing
         </label>
+        {dropNullRows && missingRows / totalRows > 0.2 && (
+          <p className="note" style={{ margin: "6px 0 0" }}>
+            That removes more than a fifth of your rows — filling the gaps on the Preprocessing tab keeps more data.
+          </p>
+        )}
       </div>
 
       {/* Per-column cleaning cards -- trim / merge / retype. Drop is in the panel
@@ -347,6 +395,15 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
                         <input type="checkbox" checked={!!s.merge} onChange={(e) => set(col, "merge", e.target.checked)} />
                         Merge inconsistent categories
                       </label>
+                      {/* show exactly what merges into what, from the audit, BEFORE running */}
+                      {mergeGroups[col] && (
+                        <div className="pp-reason" style={{ margin: "2px 0 6px 22px" }}>
+                          {mergeGroups[col].groups.map(([into, spellings]) => (
+                            <div key={into}>{spellings.map((v) => `“${v}”`).join(" + ")} → “{into}”</div>
+                          ))}
+                          {mergeGroups[col].more > 0 && <div>+ {mergeGroups[col].more} more group(s)</div>}
+                        </div>
+                      )}
                       {info[col]?.top_values && (
                         <details className="pp-values">
                           <summary>Relabel values ({info[col].top_values.length})</summary>
@@ -384,7 +441,8 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
         </>
       ) : (
         <p className="note" style={{ marginTop: 12 }}>
-          No column-level issues detected. Use the drop panel above to remove any columns you don’t need{hasDupes ? ", or remove duplicates" : ""}.
+          No column-level issues detected. Use the panels above to drop columns you don’t need, or to remove
+          duplicate rows and rows with missing values.
         </p>
       )}
 
@@ -463,6 +521,13 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
             <span>🧹 Run clean</span>
           )}
         </button>
+
+        {data.can_reset && (
+          <button type="button" className="ghost" onClick={reset} disabled={running}
+                  title="Undo every cleaning step and start again from the file you uploaded">
+            Reset to original data
+          </button>
+        )}
 
         {onProceedEDA && (
           <button
