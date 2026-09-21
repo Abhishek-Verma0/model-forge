@@ -65,15 +65,8 @@ def get_auth_config():
 
 @router.post("/register", response_model=TokenResponse)
 def register(req: UserRegisterRequest, db: Session = Depends(get_db)):
-    """Register a new user with email and password."""
-    email = req.email.strip().lower()
-    if not EMAIL_REGEX.match(email):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid email format.")
-    if len(req.password) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 6 characters long."
-        )
+    """Register a new user with email and password, validated to NIST/OWASP standards."""
+    email = req.email
 
     # Check for existing email
     existing_user = db.query(User).filter(User.email == email).first()

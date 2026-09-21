@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "./authcontext";
 
+const EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+const FORBIDDEN_NAME_CHARS = /[<>{}\\\x00-\x1f]/;
+
 export default function AuthModal() {
   const {
     authModalOpen,
@@ -33,6 +36,52 @@ export default function AuthModal() {
       setShowGoogleGuide(false);
     }
   }, [authModalOpen, authModalMode]);
+
+  // Real-time password criteria evaluation
+  const hasMinLength = password.length >= 8 && password.length <= 128;
+  const hasUpperCase = /[A-Z]/.test(password);
+  const hasLowerCase = /[a-z]/.test(password);
+  const hasNumber = /[0-9]/.test(password);
+  const hasSpecialChar = /[!@#$%^&*()_+\-=\[\]{}|;':",.<>/?~`\\]/.test(password);
+
+  const passwordRules = [
+    { id: "len", label: "8–128 characters", valid: hasMinLength },
+    { id: "upper", label: "Uppercase letter (A-Z)", valid: hasUpperCase },
+    { id: "lower", label: "Lowercase letter (a-z)", valid: hasLowerCase },
+    { id: "num", label: "Number (0-9)", valid: hasNumber },
+    { id: "spec", label: "Special symbol (!@#$...)", valid: hasSpecialChar },
+  ];
+
+  const passedRulesCount = passwordRules.filter((r) => r.valid).length;
+
+  let strengthLabel = "Weak";
+  let strengthClass = "weak";
+  let strengthBars = 1;
+
+  if (passedRulesCount === 0 || password.length === 0) {
+    strengthLabel = "Too Weak";
+    strengthClass = "weak";
+    strengthBars = 0;
+  } else if (passedRulesCount <= 2) {
+    strengthLabel = "Weak";
+    strengthClass = "weak";
+    strengthBars = 1;
+  } else if (passedRulesCount <= 3) {
+    strengthLabel = "Fair";
+    strengthClass = "fair";
+    strengthBars = 2;
+  } else if (passedRulesCount === 4) {
+    strengthLabel = "Good";
+    strengthClass = "good";
+    strengthBars = 3;
+  } else {
+    strengthLabel = "Strong";
+    strengthClass = "strong";
+    strengthBars = 4;
+  }
+
+  const isPasswordValid = passedRulesCount === 5;
+  const isConfirmMatching = confirmPassword.length > 0 && password === confirmPassword;
 
   // Load and render Google Identity Services button
   useEffect(() => {
@@ -99,19 +148,52 @@ export default function AuthModal() {
     e.preventDefault();
     setError("");
 
-    if (!email || !email.includes("@")) {
-      setError("Please enter a valid email address.");
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Validate Email
+    if (!cleanEmail) {
+      setError("Email address cannot be empty.");
+      return;
+    }
+    if (cleanEmail.length > 254) {
+      setError("Email address cannot exceed 254 characters.");
+      return;
+    }
+    if (!EMAIL_REGEX.test(cleanEmail)) {
+      setError("Please enter a valid email address (e.g. user@example.com).");
       return;
     }
 
-    if (!password || password.length < 6) {
-      setError("Password must be at least 6 characters long.");
-      return;
-    }
-
+    // Registration specific validations
     if (authModalMode === "register") {
+      if (fullName.trim()) {
+        if (fullName.trim().length < 2) {
+          setError("Full name must be at least 2 characters long.");
+          return;
+        }
+        if (fullName.trim().length > 100) {
+          setError("Full name cannot exceed 100 characters.");
+          return;
+        }
+        if (FORBIDDEN_NAME_CHARS.test(fullName)) {
+          setError("Full name contains invalid or unsafe characters.");
+          return;
+        }
+      }
+
+      if (!isPasswordValid) {
+        setError("Password does not meet all security requirements.");
+        return;
+      }
+
       if (password !== confirmPassword) {
         setError("Passwords do not match.");
+        return;
+      }
+    } else {
+      // Login validation
+      if (!password) {
+        setError("Please enter your password.");
         return;
       }
     }
@@ -119,9 +201,9 @@ export default function AuthModal() {
     setLoading(true);
     try {
       if (authModalMode === "login") {
-        await login(email, password);
+        await login(cleanEmail, password);
       } else {
-        await register(email, password, fullName);
+        await register(cleanEmail, password, fullName);
       }
     } catch (err) {
       setError(err.message || "Authentication error occurred.");
@@ -162,7 +244,7 @@ export default function AuthModal() {
           <p className="auth-subtitle">
             {authModalMode === "login"
               ? "Sign in to access your models, datasets, and pipelines"
-              : "Register to start training, auditing, and building ML workflows"}
+              : "Register with industry-standard security to start training ML models"}
           </p>
         </div>
 
@@ -253,10 +335,13 @@ export default function AuthModal() {
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="auth-form">
+        <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {authModalMode === "register" && (
             <div className="auth-field">
-              <label htmlFor="auth-name">Full Name</label>
+              <div className="auth-field-row">
+                <label htmlFor="auth-name">Full Name</label>
+                <span className="auth-field-hint">Optional</span>
+              </div>
               <input
                 id="auth-name"
                 type="text"
@@ -264,12 +349,18 @@ export default function AuthModal() {
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
                 autoComplete="name"
+                maxLength={100}
               />
             </div>
           )}
 
           <div className="auth-field">
-            <label htmlFor="auth-email">Email address</label>
+            <div className="auth-field-row">
+              <label htmlFor="auth-email">Email address</label>
+              {email.length > 0 && EMAIL_REGEX.test(email.trim()) && (
+                <span className="auth-status-badge valid">✓ Valid format</span>
+              )}
+            </div>
             <input
               id="auth-email"
               type="email"
@@ -278,6 +369,7 @@ export default function AuthModal() {
               onChange={(e) => setEmail(e.target.value)}
               required
               autoComplete="email"
+              maxLength={254}
             />
           </div>
 
@@ -285,7 +377,7 @@ export default function AuthModal() {
             <div className="auth-field-row">
               <label htmlFor="auth-password">Password</label>
               {authModalMode === "login" && (
-                <span className="auth-hint">Must be at least 6 characters</span>
+                <span className="auth-field-hint">Enter your password</span>
               )}
             </div>
             <div className="auth-input-wrapper">
@@ -296,6 +388,7 @@ export default function AuthModal() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                maxLength={128}
                 autoComplete={authModalMode === "login" ? "current-password" : "new-password"}
               />
               <button
@@ -316,11 +409,64 @@ export default function AuthModal() {
                 )}
               </button>
             </div>
+
+            {/* Password Strength Meter & Requirements (Register Mode) */}
+            {authModalMode === "register" && password.length > 0 && (
+              <div className="auth-strength-container">
+                <div className="auth-strength-header">
+                  <span className="auth-strength-label">Password strength:</span>
+                  <span className={`auth-strength-score ${strengthClass}`}>
+                    {strengthLabel}
+                  </span>
+                </div>
+                <div className="auth-strength-bars">
+                  {[1, 2, 3, 4].map((barIndex) => (
+                    <div
+                      key={barIndex}
+                      className={`auth-strength-bar ${
+                        barIndex <= strengthBars ? `filled-${strengthClass}` : ""
+                      }`}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Password Requirements Checklist (Register Mode) */}
+            {authModalMode === "register" && (
+              <div className="auth-requirements">
+                <span className="auth-req-title">Password must contain</span>
+                <ul className="auth-req-list">
+                  {passwordRules.map((rule) => (
+                    <li
+                      key={rule.id}
+                      className={`auth-req-item ${rule.valid ? "valid" : ""}`}
+                    >
+                      <span className="auth-req-icon">
+                        {rule.valid ? "✓" : "•"}
+                      </span>
+                      <span>{rule.label}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
 
           {authModalMode === "register" && (
             <div className="auth-field">
-              <label htmlFor="auth-confirm-password">Confirm Password</label>
+              <div className="auth-field-row">
+                <label htmlFor="auth-confirm-password">Confirm Password</label>
+                {confirmPassword.length > 0 && (
+                  <span
+                    className={`auth-status-badge ${
+                      isConfirmMatching ? "valid" : "invalid"
+                    }`}
+                  >
+                    {isConfirmMatching ? "✓ Passwords match" : "✕ Passwords must match"}
+                  </span>
+                )}
+              </div>
               <input
                 id="auth-confirm-password"
                 type={showPassword ? "text" : "password"}
@@ -328,6 +474,7 @@ export default function AuthModal() {
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
                 required
+                maxLength={128}
                 autoComplete="new-password"
               />
             </div>

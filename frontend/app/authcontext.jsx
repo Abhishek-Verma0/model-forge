@@ -77,15 +77,29 @@ export function AuthProvider({ children }) {
     }
   }
 
+  function formatAuthError(detail, fallback) {
+    if (!detail) return fallback;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      return detail
+        .map((d) => (d.msg ? d.msg.replace(/^Value error,\s*/i, "") : JSON.stringify(d)))
+        .join(". ");
+    }
+    if (typeof detail === "object" && detail.msg) {
+      return detail.msg.replace(/^Value error,\s*/i, "");
+    }
+    return String(detail);
+  }
+
   async function login(email, password) {
     const res = await fetch(`${API}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
     });
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data.detail || "Failed to log in.");
+      throw new Error(formatAuthError(data.detail, "Invalid email or password."));
     }
     handleAuthSuccess(data);
     return data.user;
@@ -95,11 +109,15 @@ export function AuthProvider({ children }) {
     const res = await fetch(`${API}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password, full_name: fullName }),
+      body: JSON.stringify({
+        email: email.trim().toLowerCase(),
+        password,
+        full_name: fullName ? fullName.trim() : undefined,
+      }),
     });
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data.detail || "Failed to register.");
+      throw new Error(formatAuthError(data.detail, "Failed to register account."));
     }
     handleAuthSuccess(data);
     return data.user;
@@ -113,7 +131,7 @@ export function AuthProvider({ children }) {
     });
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data.detail || "Google authentication failed.");
+      throw new Error(formatAuthError(data.detail, "Google authentication failed."));
     }
     handleAuthSuccess(data);
     return data.user;
