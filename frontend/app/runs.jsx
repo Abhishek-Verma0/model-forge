@@ -5,7 +5,9 @@ import { call, fmt } from "./apiclient";
 
 // Run history + comparison. Models from different runs are only compared inside the
 // same fingerprint (same cleaning, preprocessing, target, split and folds).
-export default function RunHistory({ dsId, metrics, refreshKey }) {
+const TRAINED = ["train", "tune"]; // runs with trained models (not estimates / explanations / curves)
+
+export default function RunHistory({ dsId, metrics, refreshKey, onOpen }) {
   const [runs, setRuns] = useState([]);
   const [picked, setPicked] = useState([]);
   const [results, setResults] = useState({});
@@ -14,7 +16,7 @@ export default function RunHistory({ dsId, metrics, refreshKey }) {
 
   async function load() {
     try {
-      const list = (await call(`/api/runs/summary?id=${dsId}`)).filter((r) => r.kind === "train");
+      const list = (await call(`/api/runs/summary?id=${dsId}`)).filter((r) => TRAINED.includes(r.kind));
       setRuns(list);
       setPicked((p) => p.filter((id) => list.some((r) => r.run_id === id)));
     } catch (e) { setErr(e.message); }
@@ -54,8 +56,9 @@ export default function RunHistory({ dsId, metrics, refreshKey }) {
         <label key={r.run_id} style={{ display: "block", margin: "4px 0" }}>
           <input type="checkbox" checked={picked.includes(r.run_id)} disabled={r.state !== "done"}
                  onChange={() => toggle(r.run_id)} />{" "}
-          {new Date(r.created * 1000).toLocaleString()} · {r.state} · {r.models.filter((m) => !m.baseline).map((m) => m.label).join(", ") || "—"}
+          {new Date(r.created * 1000).toLocaleString()} · {r.kind === "tune" ? "search + " : ""}{r.state} · {r.models.filter((m) => !m.baseline).map((m) => m.label).join(", ") || "—"}
           {" "}· {r.size_mb} MB · <span className="note">fingerprint {r.fingerprint || "—"}</span>{" "}
+          {onOpen && <button className="ghost" type="button" disabled={r.state !== "done"} onClick={() => onOpen(r)}>Open</button>}{" "}
           <button className="ghost" type="button" onClick={() => discard(r.run_id)} disabled={["queued", "running"].includes(r.state)}>Discard</button>
         </label>
       ))}

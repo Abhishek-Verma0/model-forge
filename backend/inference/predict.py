@@ -95,8 +95,9 @@ def predict(pipe, meta, raw, cleaned=False):
     """Predictions for every row of `raw`: an uploaded table in the ORIGINAL columns
     (clean ops replayed), or schema-validated manual rows (cleaned=True). Everything
     after that step is the same path."""
-    ops = [] if cleaned else [o for o in meta["clean_ops"] if o["op"] != "drop_duplicates"]
-    df = clean.apply_clean(raw, ops)[0] if ops else raw.copy()
+    # row ops (dedupe, drop rows with missing values) are never replayed: one prediction per row given
+    ops = [] if cleaned else [o for o in meta["clean_ops"] if o["op"] not in clean.ROW_OPS]
+    df = clean.apply_clean(raw, ops, replay=True)[0] if ops else raw.copy()
     df = df.reset_index(drop=True)
     missing = [c for c in meta["features"] if c not in df.columns]
     if missing:

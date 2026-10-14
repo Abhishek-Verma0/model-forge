@@ -1,9 +1,8 @@
 "use client";
 
-import { useState } from "react";
-import Image from "next/image";
+import { useEffect, useState } from "react";
 
-import { API } from "./apiclient";
+import { blobUrl, download } from "./apiclient";
 const KINDS = ["histogram", "density", "box", "violin", "scatter", "line", "bar", "pie", "tsne"];
 const NEEDS_Y = ["scatter", "line"];   // plotted against a second column
 
@@ -17,21 +16,27 @@ export default function ChartBuilder({ data }) {
   const [y, setY] = useState(cols[1] || cols[0] || "");
   const [hue, setHue] = useState("");
   const [err, setErr] = useState(false);
-
-  if (!id) return null; // backend hasn't added the dataset store / id yet
+  const [src, setSrc] = useState("");
 
   const params = new URLSearchParams({ id, kind, x });
   if (NEEDS_Y.includes(kind)) params.set("y", y);
   if (hue) params.set("hue", hue);
-  const src = `${API}/api/chart?${params.toString()}`;
+  const query = params.toString();
 
-  function download(fmt) {
-    const p = new URLSearchParams(params);
-    p.set("fmt", fmt);
-    const a = document.createElement("a");
-    a.href = `${API}/api/chart?${p.toString()}`;
-    a.download = `chart_${kind}_${x}.${fmt}`;
-    a.click();
+  // the chart route needs the session token, which an <img src> can't send: fetch it, show the blob
+  useEffect(() => {
+    if (!id) return undefined;
+    let url = "", live = true;
+    blobUrl(`/api/chart?${query}`)
+      .then((u) => { url = u; if (live) { setSrc(u); setErr(false); } })
+      .catch(() => { if (live) { setSrc(""); setErr(true); } });
+    return () => { live = false; if (url) URL.revokeObjectURL(url); };
+  }, [id, query]);
+
+  if (!id) return null;
+
+  function save(fmt) {
+    download(`/api/chart?${query}&fmt=${fmt}`, `chart_${kind}_${x}.${fmt}`).catch(() => setErr(true));
   }
 
   return (
@@ -70,24 +75,15 @@ export default function ChartBuilder({ data }) {
               ))}
             </select>
           </Field>
-          <button className="ghost" onClick={() => download("png")}>Download PNG</button>
-          <button className="ghost" onClick={() => download("svg")}>Download SVG</button>
+          <button className="ghost" onClick={() => save("png")}>Download PNG</button>
+          <button className="ghost" onClick={() => save("svg")}>Download SVG</button>
         </div>
 
         <div className="builder-img-wrap" style={{ position: "relative", width: "100%", maxWidth: 680, marginTop: 12 }}>
-          <Image
-            key={src}
-            src={src}
-            alt="chart"
-            width={680}
-            height={450}
-            sizes="(max-width: 768px) 100vw, 680px"
-            className="eda-img"
-            style={{ width: "100%", height: "auto", display: err ? "none" : "block" }}
-            unoptimized
-            onLoad={() => setErr(false)}
-            onError={() => setErr(true)}
-          />
+          {src && !err && (
+            // eslint-disable-next-line @next/next/no-img-element -- a blob: URL from an authenticated fetch
+            <img src={src} alt={`${kind} chart`} className="eda-img" style={{ width: "100%", height: "auto", display: "block" }} />
+          )}
         </div>
         {err && (
           <p className="target-note" style={{ marginTop: 12 }}>

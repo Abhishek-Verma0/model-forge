@@ -1,5 +1,8 @@
 """Security utilities: password hashing (bcrypt) and JWT tokens."""
 
+import hashlib
+import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -8,9 +11,29 @@ import jwt
 
 from core import config
 
-DEFAULT_SECRET = "modelforge-super-secure-production-jwt-token-secret-key-2026-v1"
-SECRET_KEY = config.JWT_SECRET_KEY if len(config.JWT_SECRET_KEY) >= 32 else DEFAULT_SECRET
 ALGORITHM = config.JWT_ALGORITHM
+RESET_MINUTES = 30   # our starting point: how long a password-reset link stays valid
+MIN_SECRET = 32      # HS256 key length: at least the 256-bit hash size (RFC 7518 section 3.2)
+
+
+def _secret():
+    """JWT_SECRET_KEY when set; otherwise one random key generated for this install
+    and kept in DATA_DIR (never in the repo -- a key anyone can read lets anyone
+    sign a token for any user)."""
+    if len(config.JWT_SECRET_KEY) >= MIN_SECRET:
+        return config.JWT_SECRET_KEY
+    path = config.DATA_DIR / ".jwt_secret"
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_urlsafe(48)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key)
+    return key
+
+
+SECRET_KEY = _secret()
 
 
 def get_password_hash(password: str) -> str:
@@ -46,9 +69,33 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
 
 
 def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
-    """Decode and validate a signed JWT access token."""
+    """Decode and validate a signed JWT access token. A reset token is not a session."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
     except jwt.PyJWTError:
         return None
+    return None if payload.get("purpose") else payload
+
+
+def _password_mark(hashed_password):
+    # changes whenever the password changes, so a used reset link stops working
+    return hashlib.sha256((hashed_password or "").encode("utf-8")).hexdigest()[:16]
+
+
+def create_reset_token(user) -> str:
+    return create_access_token({"sub": str(user.id), "purpose": "reset",
+                                "pwd": _password_mark(user.hashed_password)},
+                               timedelta(minutes=RESET_MINUTES))
+
+
+def reset_token_user_id(token: str, lookup) -> Optional[int]:
+    """The user id a reset token is for, or None when it is invalid, expired or
+    already used. `lookup(id)` returns the user (to compare the password mark)."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = lookup(int(payload["sub"])) if payload.get("purpose") == "reset" else None
+    except (jwt.PyJWTError, KeyError, ValueError):
+        return None
+    if user is None or payload.get("pwd") != _password_mark(user.hashed_password):
+        return None
+    return user.id

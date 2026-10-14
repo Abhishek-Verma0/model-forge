@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 
-import { API } from "./apiclient";
+import { call, download } from "./apiclient";
+import Icon from "./icons";
 
 // Each control maps to ONE separable operation. Scaling defaults to "none" --
 // median-impute must not silently scale a column (that was the 0.5/0.6 bug).
@@ -206,14 +207,15 @@ function pipelineFromAI(opts, p) {
   };
 }
 
-export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan, onDone, onProceedTraining }) {
+export default function Preprocess({ data, target, task, plan, aiPipeline, planLoading, planErr, onApplyAI, onPlan, onDone }) {
   const { info, semType, missPct, feats } = meta(data, target);
   const opts = data.preprocess_options;
   const [steps, setSteps] = useState(() => defaultSteps(data, target));
   // Train/test split -- plan §10 wants these user-chosen, and a recorded seed is
   // what makes a run reproducible. Defaults come from the backend.
   const [split, setSplit] = useState({ test_size: opts.split.test_size, random_state: opts.split.random_state,
-                                       stratify: opts.split.stratify });
+                                       stratify: opts.split.stratify, group: "" });
+  const clustering = task === "clustering";
   const setSp = (k, v) => setSplit((s) => ({ ...s, [k]: v }));
 
   const [pipeline, setPipeline] = useState({
@@ -232,7 +234,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   }, [steps, target]);
 
   if (!data.id) return null;
-  if (!target)
+  if (!target && !clustering)
     return (
       <section>
         <p className="note">Choose a target column above to configure preprocessing.</p>
@@ -297,24 +299,14 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
     const columns = {};
     for (const col of feats) columns[col] = toOps(opts, steps[col], semType[col] === "numeric");
     try {
-      const res = await fetch(`${API}/api/preprocess`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: data.id, target, task, columns, pipeline: buildPipeline(),
-          test_size: Number(split.test_size), random_state: Number(split.random_state),
-          stratify: split.stratify,
-        }),
-      });
-      if (!res.ok) {
-        let d = `Error ${res.status}`;
-        try { const j = await res.json(); if (j.detail) d = j.detail; } catch {}
-        throw new Error(d);
-      }
-      setResult(await res.json());
+      setResult(await call("/api/preprocess", {
+        id: data.id, target: clustering ? null : target, task, columns, pipeline: buildPipeline(),
+        test_size: Number(split.test_size), random_state: Number(split.random_state),
+        stratify: split.stratify, group: split.group || null,
+      }));
       onDone?.();
     } catch (e) {
-      setError(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
+      setError(e.message);
     } finally { setLoading(false); }
   }
 
@@ -322,7 +314,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
 
   return (
     <section>
-      <p className="sectitle">Preprocess — target: {target} · {task}</p>
+      <p className="sectitle">Preprocess — {clustering ? "clustering (no target)" : `target: ${target} · ${task}`}</p>
 
       {/* Steps 1–2: what was detected + what the AI recommends */}
       <div className="pp-steps">
@@ -348,29 +340,62 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         </div>
       </div>
 
-      {/* Train/test split -- ratio, seed, stratify */}
-      <div className="panel" style={{ padding: 16, marginBottom: 12 }}>
-        <p style={{ margin: "0 0 4px", fontWeight: 600, fontSize: 14 }}>Train / test split</p>
-        <p className="note" style={{ margin: "0 0 10px" }}>
-          Same seed + same settings reproduce the same split.
-        </p>
-        <div className="builder-row">
-          <label className="pp-field"><span>Split</span>
-            <select value={split.test_size} onChange={(e) => setSp("test_size", e.target.value)}>
-              {SPLIT_OPTS.filter((x) => x.v >= opts.split.test_size_min && x.v <= opts.split.test_size_max).map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
-            </select>
-          </label>
-          <label className="pp-field"><span>Random seed</span>
-            <input type="number" min="0" value={split.random_state}
-                   onChange={(e) => setSp("random_state", e.target.value)} />
-          </label>
-          <label className="pp-field"><span>Stratified</span>
-            <input type="checkbox" checked={split.stratify}
-                   disabled={task !== "classification"}
-                   onChange={(e) => setSp("stratify", e.target.checked)} />
+      {/* Train/test split -- ratio (preset or custom), seed, stratify, group */}
+      {clustering ? (
+        <div className="panel" style={{ padding: 16, marginBottom: 12 }}>
+          <p style={{ margin: 0, fontWeight: 600, fontSize: 14 }}>No train / test split</p>
+          <p className="note" style={{ margin: "4px 0 0" }}>
+            Clustering has no target to predict, so every row is used and gets a cluster. The seed below makes the
+            clustering methods reproducible.
+          </p>
+          <label className="pp-field" style={{ maxWidth: 140, marginTop: 8 }}><span>Random seed</span>
+            <input type="number" min="0" value={split.random_state} onChange={(e) => setSp("random_state", e.target.value)} />
           </label>
         </div>
-      </div>
+      ) : (
+        <div className="panel" style={{ padding: 16, marginBottom: 12 }}>
+          <p style={{ margin: "0 0 4px", fontWeight: 600, fontSize: 14 }}>Train / test split</p>
+          <p className="note" style={{ margin: "0 0 10px" }}>
+            Same seed + same settings reproduce the same split.
+          </p>
+          <div className="builder-row">
+            <label className="pp-field"><span>Split</span>
+              <select value={SPLIT_OPTS.some((x) => Number(x.v) === Number(split.test_size)) ? split.test_size : "custom"}
+                      onChange={(e) => e.target.value !== "custom" && setSp("test_size", e.target.value)}>
+                {SPLIT_OPTS.filter((x) => x.v >= opts.split.test_size_min && x.v <= opts.split.test_size_max).map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+                <option value="custom">custom…</option>
+              </select>
+            </label>
+            <label className="pp-field" style={{ maxWidth: 150 }}>
+              <span>Test share ({opts.split.test_size_min}–{opts.split.test_size_max})</span>
+              <input type="number" min={opts.split.test_size_min} max={opts.split.test_size_max} step="0.01"
+                     value={split.test_size} onChange={(e) => setSp("test_size", e.target.value)} />
+            </label>
+            <label className="pp-field"><span>Random seed</span>
+              <input type="number" min="0" value={split.random_state}
+                     onChange={(e) => setSp("random_state", e.target.value)} />
+            </label>
+            <label className="pp-field"><span>Stratified</span>
+              <input type="checkbox" checked={split.stratify && !split.group}
+                     disabled={task !== "classification" || !!split.group}
+                     onChange={(e) => setSp("stratify", e.target.checked)} />
+            </label>
+            <label className="pp-field" title="Rows that belong together (the same patient, subject or school) stay on one side of the split and of every CV fold - otherwise the model is tested on people it has already seen.">
+              <span>Keep together (group column)</span>
+              <select value={split.group} onChange={(e) => setSp("group", e.target.value)}>
+                <option value="">— none —</option>
+                {feats.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+          </div>
+          {split.group && (
+            <p className="note" style={{ margin: "6px 0 0" }}>
+              Split by <b>{split.group}</b>: the test share counts groups, not rows, and the column itself is not used as a
+              feature. Stratification can&apos;t be combined with groups.
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Dataset-level steps (optional) -- act on the whole train matrix */}
       <div className="panel" style={{ padding: 16, marginBottom: 12 }}>
@@ -401,8 +426,8 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                      onChange={(e) => setPipe("contamination", e.target.value)} />
             </label>
           )}
-          <label className="pp-field"><span>Feature selection</span>
-            <select value={pipeline.feature_selection} onChange={(e) => setPipe("feature_selection", e.target.value)}>
+          <label className="pp-field"><span>Feature selection{clustering ? " (needs a target)" : ""}</span>
+            <select value={pipeline.feature_selection} disabled={clustering} onChange={(e) => setPipe("feature_selection", e.target.value)}>
               {opts.pipeline.feature_selection.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           </label>
@@ -522,10 +547,11 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
         <div className="panel" style={{ marginTop: 12, padding: 16 }}>
           <div className="target-note" style={{ marginBottom: 10 }}>
             {result.rows_before.toLocaleString()} rows · {result.features_in} → {result.features_out} features ·
-            train/test {result.train_rows.toLocaleString()}/{result.test_rows.toLocaleString()} ·
-            {result.stratified ? " stratified" : " random"} split
-            {` ${Math.round((1 - result.test_size) * 100)}:${Math.round(result.test_size * 100)}`} ·
-            seed {result.random_state}
+            {result.task === "clustering" ? ` all ${result.train_rows.toLocaleString()} rows (no split) ·` : <>
+              {" "}train/test {result.train_rows.toLocaleString()}/{result.test_rows.toLocaleString()} ·
+              {result.group ? ` grouped by ${result.group}` : result.stratified ? " stratified" : " random"} split
+              {` ${Math.round((1 - result.test_size) * 100)}:${Math.round(result.test_size * 100)}`} ·</>}
+            {" "}seed {result.random_state}
             {result.dropped_columns.length > 0 && ` · dropped: ${result.dropped_columns.join(", ")}`}
           </div>
 
@@ -567,21 +593,15 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           )}
 
           <PreviewTable rows={result.preview} />
-          <a
-            className="ghost"
-            style={{ display: "inline-block", marginTop: 12, padding: "8px 16px", textDecoration: "none" }}
-            href={`${API}/api/download?id=${data.id}`}
-          >
-            Download cleaned CSV
-          </a>
-          <a
-            className="ghost"
-            style={{ display: "inline-block", marginTop: 12, marginLeft: 8, padding: "8px 16px", textDecoration: "none" }}
-            href={`${API}/api/pipeline?id=${data.id}`}
-            title="Fitted steps + text TF-IDF, to apply the same preprocessing at training and on new rows"
-          >
-            Download pipeline
-          </a>
+          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+            <button className="ghost" onClick={() => download(`/api/download?id=${data.id}`, "cleaned.csv").catch((e) => setError(e.message))}>
+              Download cleaned CSV
+            </button>
+            <button className="ghost" title="Fitted steps + text TF-IDF, to apply the same preprocessing at training and on new rows"
+                    onClick={() => download(`/api/pipeline?id=${data.id}`, "pipeline.joblib").catch((e) => setError(e.message))}>
+              Download pipeline
+            </button>
+          </div>
         </div>
       )}
 
@@ -593,7 +613,7 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
           </p>
           {result && (
             <p className="note" style={{ margin: 0, color: "var(--forge-green, #2d6a4f)", fontWeight: 600 }}>
-              ✓ Preprocessing completed. Training tab is ready.
+              <Icon name="check" size={14} strokeWidth={3} /> Preprocessing done. {clustering ? "Clustering" : "Training"} is unlocked.
             </p>
           )}
         </div>
@@ -612,23 +632,10 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                 <span>Processing…</span>
               </>
             ) : (
-              <span>⚙️ {result ? "Re-run Processing" : "Run Processing"}</span>
+              <><Icon name="sliders" size={17} /> <span>{result ? "Run preprocessing again" : "Run preprocessing"}</span></>
             )}
           </button>
 
-          {onProceedTraining && (
-            <button
-              id="btn-proceed-training"
-              type="button"
-              className="btn-proceed-audit"
-              onClick={onProceedTraining}
-            >
-              <span>Proceed to Model Training</span>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                <path d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
-            </button>
-          )}
         </div>
       </div>
     </section>

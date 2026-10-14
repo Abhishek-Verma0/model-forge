@@ -29,7 +29,7 @@ import json
 import numpy as np
 import sklearn
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
 from preprocessing import advanced, clean
@@ -217,16 +217,33 @@ def guard_target(df, target, task):
     return df, notes
 
 
-def prepare_rows(df, target, columns, task):
+def prepare_rows(df, target, columns, task, group=None):
     """Target guard + whole-table row/column steps, shared by preprocessing and
-    training so both work on the same rows. Returns (df, feats, drop_cols, notes)."""
-    df, notes = guard_target(df, target, task)
+    training so both work on the same rows. Returns (df, feats, drop_cols, notes).
+    Clustering has no target (target may be None). `group` names a column whose
+    rows belong together (a subject, patient, school): it is never a feature, and
+    rows without a group are removed."""
+    if task == "clustering":
+        notes = []
+        if target and target in df.columns:
+            notes.append(f"{target} is not used for clustering - it is kept out of the features")
+    else:
+        df, notes = guard_target(df, target, task)
+    if group:
+        if group not in df.columns:
+            raise ValueError(f"Group column '{group}' is not a column in this dataset.")
+        if group == target:
+            raise ValueError("The group column can't be the target.")
+        no_group = missing_mask(df[group])
+        if no_group.any():
+            df = df[~no_group]
+            notes.append(f"{int(no_group.sum())} row(s) had no {group} value and were removed")
     drop_cols = [c for c, ops in columns.items() if any(o["op"] == "drop_column" for o in ops)]
     row_cols = [c for c, ops in columns.items()
                 if any(o["op"] == "drop_rows_missing" for o in ops) and c in df.columns]
     if row_cols:
         df = df.dropna(subset=row_cols)
-    feats = [c for c in df.columns if c != target and c not in drop_cols]
+    feats = [c for c in df.columns if c != target and c != group and c not in drop_cols]
     if not feats:
         raise ValueError("No feature columns left after drops.")
     if len(df) < 5:
@@ -234,9 +251,18 @@ def prepare_rows(df, target, columns, task):
     return df, feats, drop_cols, notes
 
 
-def split(X, y, task, test_size, random_state, stratify):
+def split(X, y, task, test_size, random_state, stratify, groups=None):
     """The locked train/test split -- one function, so training reproduces the
-    preprocessing run's split exactly. Returns (X_tr, X_te, y_tr, y_te, stratified)."""
+    preprocessing run's split exactly. Returns (X_tr, X_te, y_tr, y_te, stratified).
+    With `groups` (a Series aligned to X), whole groups go to one side: test_size is
+    then the share of GROUPS (scikit-learn GroupShuffleSplit), and stratification
+    can't be combined with it."""
+    if groups is not None:
+        if groups.nunique() < 2:
+            raise ValueError("The group column needs at least 2 different groups to split.")
+        tr, te = next(GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+                      .split(X, y, groups))
+        return X.iloc[tr], X.iloc[te], y.iloc[tr], y.iloc[te], False
     strat = y if (stratify and task == "classification" and y.nunique() > 1
                   and y.value_counts().min() >= 2) else None
     X_tr, X_te, y_tr, y_te = train_test_split(
@@ -301,7 +327,8 @@ def fit_prep(X_tr, y_tr, columns, pipeline, task, intlike_cols):
             tr_out, tr_out.iloc[:0], y_tr, advanced._m("feature_selection", pipeline), k, task)
         notes.append(_n)
     if advanced._m("reduction", pipeline):
-        fitted["pca"], _n = advanced.fit_reduce(tr_out, (pipeline.get("reduction") or {}).get("n", PCA_N))
+        fitted["pca"], _n = advanced.fit_reduce(tr_out, (pipeline.get("reduction") or {}).get("n", PCA_N),
+                                                advanced._m("reduction", pipeline))
         if fitted["pca"]:
             tr_out = advanced.reduce_apply(fitted["pca"], tr_out)
         notes.append(_n)
@@ -337,15 +364,24 @@ def options():
     }
 
 
+TASKS = ("classification", "regression", "clustering")
+_NEEDS_TARGET = ("feature_selection", "imbalance")   # pipeline steps that learn from the target
+
+
 def apply_plan(df, target, columns, task="classification", test_size=None,
-               random_state=None, pipeline=None, stratify=STRATIFY):
+               random_state=None, pipeline=None, stratify=STRATIFY, group=None):
     """Run a validated per-column op plan, fit on train only. Returns preview,
     cleaned CSV, a per-column change summary and the fitted pipeline. `pipeline` =
     optional dataset-level stage (advanced impute / outlier removal / feature
     selection / imbalance / reduction) -- see fit_prep and advanced.py.
 
     test_size / random_state default to TEST_SIZE / RANDOM_STATE so the same settings
-    reproduce the same split; `stratify=False` forces a plain random split."""
+    reproduce the same split; `stratify=False` forces a plain random split; `group`
+    keeps each group's rows on one side of the split (and of every CV fold).
+    task="clustering": no target and no split -- every row is clustered, so the
+    preprocessing is fitted on all rows (there is no held-out set to leak into)."""
+    if task not in TASKS:
+        raise ValueError(f"task must be one of {', '.join(TASKS)} (got '{task}').")
     test_size = TEST_SIZE if test_size is None else float(test_size)
     random_state = RANDOM_STATE if random_state is None else int(random_state)
     if not TEST_SIZE_MIN <= test_size <= TEST_SIZE_MAX:
@@ -355,33 +391,54 @@ def apply_plan(df, target, columns, task="classification", test_size=None,
             _validate(op)
     pipeline = pipeline or {}
     advanced.validate_pipeline(pipeline)
+    clustering = task == "clustering"
+    if clustering:
+        for section in _NEEDS_TARGET:
+            if advanced._m(section, pipeline):
+                raise ValueError(f"{section.replace('_', ' ')} learns from a target - clustering has none. "
+                                 "Set it to none.")
+        target, group = (target or None), None
 
-    df, feats, drop_cols, target_notes = prepare_rows(df, target, columns, task)
-    X_tr, X_te, y_tr, y_te, stratified = split(df[feats], df[target], task, test_size, random_state, stratify)
+    df, feats, drop_cols, target_notes = prepare_rows(df, target, columns, task, group)
     intlike_cols = {c for c in feats if _is_intlike(df[c])}
+    settings = {"columns": columns, "pipeline": pipeline, "task": task, "test_size": test_size,
+                "random_state": random_state, "stratify": stratify, "group": group}
+    if clustering:
+        X_tr, X_te, y_tr, y_te, stratified = df[feats], df[feats].iloc[:0], None, None, False
+        if any(o.get("method") == "remove_rows" for ops in columns.values() for o in ops)                 or advanced._m("outlier_removal", pipeline):
+            target_notes.append("outlier row removal is not used for clustering - every row gets a cluster")
+    else:
+        X_tr, X_te, y_tr, y_te, stratified = split(df[feats], df[target], task, test_size, random_state, stratify,
+                                                   df[group] if group else None)
+        if group:
+            target_notes.append(f"split by {group}: {df[group].loc[X_tr.index].nunique()} group(s) train, "
+                                f"{df[group].loc[X_te.index].nunique()} test - no group is on both sides")
     fitted, tr_out, summary, pipe_notes, class_weights = fit_prep(
         X_tr, y_tr, columns, pipeline, task, intlike_cols)
     fitted["target"] = target
-    fitted["settings"] = {"columns": columns, "pipeline": pipeline, "task": task, "test_size": test_size,
-                          "random_state": random_state, "stratify": stratify}
-    te_out = transform(fitted, X_te)
+    fitted["settings"] = settings
+    te_out = transform(fitted, X_te) if len(X_te) else tr_out.iloc[:0]
 
     tr_out = tr_out.reset_index(drop=True)
     te_out = te_out.reset_index(drop=True)
-    tr_out[target], te_out[target] = list(y_tr), list(y_te)
-    tr_out["__split__"], te_out["__split__"] = "train", "test"
+    if not clustering:
+        tr_out[target], te_out[target] = list(y_tr), list(y_te)
+    tr_out["__split__"], te_out["__split__"] = ("all" if clustering else "train"), "test"
     cleaned = pd.concat([tr_out, te_out], ignore_index=True)
+    extra = 1 if clustering else 2   # __split__ (+ target)
 
     return {
+        "task": task,
         "rows_before": len(df),
         "train_rows": len(tr_out),
         "test_rows": len(te_out),
         "features_in": len(feats),
-        "features_out": tr_out.shape[1] - 2,  # minus target + __split__
+        "features_out": tr_out.shape[1] - extra,
         "dropped_columns": drop_cols,
         "stratified": stratified,
-        "test_size": test_size,
+        "test_size": None if clustering else test_size,
         "random_state": random_state,
+        "group": group,
         "summary": summary,
         "pipeline": pipe_notes,
         "class_weights": class_weights,
@@ -399,7 +456,7 @@ def transform(fitted, df):
     were asked to predict."""
     ops = [o for o in fitted["clean_ops"] if o["op"] not in clean.ROW_OPS]  # new rows are never dropped
     if ops:
-        df, _ = clean.apply_clean(df, ops)
+        df, _ = clean.apply_clean(df, ops, replay=True)
     X = df[fitted["features"]].copy()
     if fitted["impute"]:
         X = advanced.impute_apply(fitted["impute"], X)
@@ -631,3 +688,25 @@ if __name__ == "__main__":
     json.dumps(o)  # sent inside the analyze response
     print("options self-check passed")
     print("split + parameter self-check passed")
+
+    # clustering: no target, no split -- every row is preprocessed (and later clustered)
+    cl = apply_plan(df, None, {"sex": [{"op": "encode", "method": "onehot"}],
+                               "age": [{"op": "impute", "strategy": "median"}]}, task="clustering")
+    assert cl["train_rows"] == len(df) and cl["test_rows"] == 0 and cl["fitted"]["target"] is None, cl
+    assert "label" in cl["fitted"]["features"]       # no target: every column is a feature
+    try:
+        apply_plan(df, None, {}, task="clustering", pipeline={"feature_selection": {"method": "anova", "k": 2}})
+        raise AssertionError("feature selection needs a target")
+    except ValueError as e:
+        assert "learns from a target" in str(e), e
+
+    # group split: a subject's rows never sit on both sides
+    subj = pd.DataFrame({"subject": np.repeat(range(20), 3), "x": np.arange(60) % 7,
+                         "y": ["a", "b"] * 30})
+    gs = apply_plan(subj, "y", {}, group="subject", random_state=3)
+    fg = gs["fitted"]
+    assert "subject" not in fg["features"] and fg["settings"]["group"] == "subject"
+    X_tr, X_te, *_ = split(subj[["x"]], subj["y"], "classification", 0.2, 3, True, subj["subject"])
+    assert not set(subj.loc[X_tr.index, "subject"]) & set(subj.loc[X_te.index, "subject"])
+    assert any("no group is on both sides" in n for n in gs["notes"]), gs["notes"]
+    print("clustering + group split self-check passed")

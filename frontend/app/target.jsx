@@ -25,7 +25,15 @@ export function suggestTarget(profile, report, semType, info) {
   return cols[cols.length - 1] || profile.column_names[profile.column_names.length - 1];
 }
 
-export default function TargetPicker({ data, target, setTarget }) {
+// The task follows from the target's type unless the user chooses: a 0/1/2- or
+// 1-5-coded class is numeric but is classification (plan §7 step 3: the system
+// recommends classification, regression or clustering -- the user decides).
+export function derivedTask(semType, target) {
+  if (!target) return "";
+  return semType[target] === "numeric" ? "regression" : "classification";
+}
+
+export default function TargetPicker({ data, target, setTarget, taskChoice = "auto", setTaskChoice }) {
   const { profile, report } = data;
   const info = profile.columns_info;
   const semType = {};
@@ -35,8 +43,11 @@ export default function TargetPicker({ data, target, setTarget }) {
 
   const t = info[target];
   const type = semType[target];
-  const problem = !target
+  const recommended = derivedTask(semType, target);
+  const clustering = taskChoice === "clustering";
+  const problem = clustering ? "clustering" : !target
     ? "none"
+    : taskChoice !== "auto" ? taskChoice
     : type === "numeric" ? "regression" : type === "boolean" || type === "categorical" ? "classification" : "unusual";
 
   return (
@@ -46,8 +57,8 @@ export default function TargetPicker({ data, target, setTarget }) {
         <div className="target-row">
           <label>
             <b>Which column do you want to predict?</b>&nbsp;
-            <select value={target} onChange={(e) => setTarget(e.target.value)}>
-              <option value="">— choose target —</option>
+            <select value={target} onChange={(e) => setTarget(e.target.value)} disabled={clustering}>
+              <option value="">{clustering ? "— none (clustering) —" : "— choose target —"}</option>
               {profile.column_names.map((n) => (
                 <option key={n} value={n}>
                   {n}
@@ -56,9 +67,26 @@ export default function TargetPicker({ data, target, setTarget }) {
             </select>
           </label>
           {problem !== "none" && <span className="tag">{problem}</span>}
-          <span className="target-note">suggested: {suggested}</span>
+          {!clustering && <span className="target-note">suggested: {suggested}</span>}
+          {setTaskChoice && (
+            <label style={{ marginLeft: "auto" }}>
+              <b>Task</b>&nbsp;
+              <select value={taskChoice} onChange={(e) => setTaskChoice(e.target.value)}>
+                <option value="auto">{recommended ? `auto (${recommended})` : "auto (from the target)"}</option>
+                <option value="classification">classification</option>
+                <option value="regression">regression</option>
+                <option value="clustering">clustering (no target)</option>
+              </select>
+            </label>
+          )}
         </div>
 
+        {problem === "clustering" && (
+          <p className="target-note">
+            Clustering looks for groups of similar rows without a target. Preprocess, then the Train tab offers K-Means,
+            hierarchical clustering, DBSCAN and Gaussian mixtures.
+          </p>
+        )}
         {problem === "none" && (
           <p className="target-note">
             Pick your outcome column above — it drives the AI’s cleaning &amp; preprocessing suggestions,

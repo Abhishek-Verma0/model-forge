@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { recommendedPlan } from "./preprocess";
 
-import { API } from "./apiclient";
+import { stream } from "./apiclient";
 
 // Tiny, safe markdown -> HTML for chat bubbles: escape first (LLM output is
 // untrusted), then bold / inline-code / bullets / line breaks. ponytail: not
@@ -82,30 +82,17 @@ export default function ChatPanel({ data, target, task, plan, results, asked }) 
     setLoading(true);
     setErr("");
     try {
-      const res = await fetch(`${API}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: ctrl.signal,
-        body: JSON.stringify({
-          messages: outgoing.map(({ role, content }) => ({ role, content })),
-          // live edited plan when it belongs to this target (so the AI remembers the
-          // user's decisions), else the rule-based recommendation for this target.
-          context: {
-            ...(plan?.target === target ? plan : recommendedPlan(data, target, task)),
-            rows: data.profile.rows,
-            dataset_facts: columnFacts(data),
-            results, // the training run on the page; the backend keeps only what the question needs
-          },
-        }),
-      });
-      if (!res.ok) {
-        let d = `Error ${res.status}`;
-        try {
-          const j = await res.json();
-          if (j.detail) d = j.detail;
-        } catch {}
-        throw new Error(d);
-      }
+      const res = await stream("/api/chat", {
+        messages: outgoing.map(({ role, content }) => ({ role, content })),
+        // live edited plan when it belongs to this target (so the AI remembers the
+        // user's decisions), else the rule-based recommendation for this target.
+        context: {
+          ...(plan?.target === target ? plan : recommendedPlan(data, target, task)),
+          rows: data.profile.rows,
+          dataset_facts: columnFacts(data),
+          results, // the training run on the page; the backend keeps only what the question needs
+        },
+      }, ctrl.signal);
       // Stream the reply as it arrives, growing the last assistant bubble.
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -130,7 +117,7 @@ export default function ChatPanel({ data, target, task, plan, results, asked }) 
       if (!started) setMessages((m) => [...m, { role: "assistant", content: "(no response)" }]);
     } catch (e) {
       if (e.name === "AbortError") return;   // replaced by a newer question
-      setErr(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
+      setErr(e.message);
     } finally {
       if (inFlight.current === ctrl) setLoading(false);
     }

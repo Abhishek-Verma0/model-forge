@@ -1,8 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Icon from "./icons";
 
-export default function DatasetPreview({ data, onProceed, onClean, target, setTarget }) {
+export default function DatasetPreview({ data, target }) {
   const { profile, report, sample = [], filename } = data;
   const info = profile?.columns_info || {};
   const checks = report?.checks || {};
@@ -98,23 +99,13 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
 
   return (
     <div className="preview-view-container">
-      {/* Header */}
-      <div className="preview-view-header">
-        <div>
-          <h1 className="preview-title">Dataset Preview</h1>
-          <p className="preview-subtitle">
-            Inspect dataset schema summary, target class balance, and live sample rows before running transformations.
-          </p>
-        </div>
-      </div>
-
       {/* Top 2-Column Grid matching reference */}
       <div className="preview-top-grid">
         {/* Left Card: Dataset Summary */}
         <div className="preview-card summary-card">
           <div className="preview-card-header">
             <div className="card-title-group">
-              <span className="card-icon">📋</span>
+              <span className="card-icon"><Icon name="table" size={17} /></span>
               <h3 className="card-heading">Dataset Summary</h3>
             </div>
             <span className="filename-tag">{filename}</span>
@@ -147,7 +138,7 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
               <span className="summary-label">Missing Cell Rate</span>
               <span className="summary-value">
                 {checks.missing_values?.summary?.total_missing_cells === 0 ? (
-                  <span className="clean-badge">✓ 0% Clean (0 nulls)</span>
+                  <span className="clean-badge"><Icon name="check" size={13} strokeWidth={3} /> None missing</span>
                 ) : (
                   <span className="warn-badge">
                     {checks.missing_values?.summary?.total_missing_cells} missing cells
@@ -160,7 +151,7 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
               <span className="summary-label">Duplicate Rows</span>
               <span className="summary-value">
                 {profile?.duplicate_rows === 0 ? (
-                  <span className="clean-badge">✓ None (0%)</span>
+                  <span className="clean-badge"><Icon name="check" size={13} strokeWidth={3} /> None</span>
                 ) : (
                   <span className="warn-badge">{profile?.duplicate_rows} duplicates</span>
                 )}
@@ -171,8 +162,8 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
               <span className="summary-label">Recommended Task</span>
               <span className="summary-value task-type-badge">
                 {selectedCol && info[selectedCol]?.type === "numeric"
-                  ? "📈 Regression"
-                  : "🎯 Classification"}
+                  ? <><Icon name="trendingUp" size={14} /> Regression</>
+                  : <><Icon name="target" size={14} /> Classification</>}
               </span>
             </div>
           </div>
@@ -182,7 +173,7 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
         <div className="preview-card distribution-card">
           <div className="preview-card-header">
             <div className="card-title-group">
-              <span className="card-icon">🍩</span>
+              <span className="card-icon"><Icon name="chart" size={17} /></span>
               <h3 className="card-heading">Class & Feature Distribution</h3>
             </div>
             {classCols.length > 1 && (
@@ -287,10 +278,7 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
 
           <div className="table-header-right">
             <div className="table-search-box">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                <circle cx="11" cy="11" r="8" />
-                <line x1="21" y1="21" x2="16.65" y2="16.65" />
-              </svg>
+              <Icon name="search" size={15} />
               <input
                 type="text"
                 className="table-search-input"
@@ -303,8 +291,9 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
                   type="button"
                   className="btn-clear-search"
                   onClick={() => setSearchQuery("")}
+                  aria-label="Clear search"
                 >
-                  ✕
+                  <Icon name="x" size={14} />
                 </button>
               )}
             </div>
@@ -371,19 +360,6 @@ export default function DatasetPreview({ data, onProceed, onClean, target, setTa
         </div>
       </div>
 
-      {/* Action Bar Footer */}
-      <div className="preview-action-bar">
-        <button id="btn-proceed-audit" type="button" className="btn-proceed-audit" onClick={onProceed}>
-          <span>Proceed to Quality Audit</span>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </button>
-
-        <button id="btn-clean-jump" type="button" className="btn-clean-jump" onClick={onClean}>
-          <span>Jump to Cleaning Studio</span>
-        </button>
-      </div>
     </div>
   );
 }

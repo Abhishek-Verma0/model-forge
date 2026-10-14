@@ -16,6 +16,7 @@ export default function AuthModal() {
     register,
     loginWithGoogle,
     googleClientId,
+    passwordReset,
   } = useAuth();
 
   const [email, setEmail] = useState("");
@@ -143,6 +144,7 @@ export default function AuthModal() {
   }, [authModalOpen, authModalMode, googleClientId]);
 
   if (!authModalOpen) return null;
+  if (authModalMode === "forgot" || authModalMode === "reset") return <Recovery />;
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -497,6 +499,13 @@ export default function AuthModal() {
 
         {/* Footer switch prompt */}
         <div className="auth-footer">
+          {authModalMode === "login" && passwordReset && (
+            <p style={{ marginBottom: 6 }}>
+              <button type="button" className="auth-link-btn" onClick={() => setAuthModalMode("forgot")}>
+                Forgot your password?
+              </button>
+            </p>
+          )}
           {authModalMode === "login" ? (
             <p>
               Don&apos;t have an account?{" "}
@@ -520,6 +529,87 @@ export default function AuthModal() {
               </button>
             </p>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// Password recovery (plan §8.1): "forgot" emails a single-use link; "reset" (opened by
+// that link) sets the new password and signs in. Same password rules as registration
+// -- the server checks them again.
+function Recovery() {
+  const { authModalMode, setAuthModalMode, closeAuthModal, forgotPassword, resetPassword } = useAuth();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [msg, setMsg] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const forgot = authModalMode === "forgot";
+
+  async function submit(e) {
+    e.preventDefault();
+    setError(""); setMsg("");
+    if (forgot && !EMAIL_REGEX.test(email.trim().toLowerCase())) { setError("Please enter a valid email address."); return; }
+    if (!forgot && password !== confirm) { setError("Passwords do not match."); return; }
+    setLoading(true);
+    try {
+      if (forgot) setMsg(await forgotPassword(email));
+      else await resetPassword(password);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="auth-overlay" onClick={closeAuthModal}>
+      <div className="auth-modal" onClick={(e) => e.stopPropagation()}>
+        <button type="button" className="auth-modal-close" onClick={closeAuthModal} aria-label="Close modal">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+        </button>
+        <div className="auth-header">
+          <h2 className="auth-title">{forgot ? "Reset your password" : "Choose a new password"}</h2>
+          <p className="auth-subtitle">
+            {forgot ? "We'll email you a link. It works once and expires after 30 minutes."
+                    : "8+ characters with an uppercase letter, a lowercase letter, a number and a special character."}
+          </p>
+        </div>
+        {error && <div className="auth-error-banner"><span>{error}</span></div>}
+        {msg ? (
+          <p style={{ padding: "0 4px" }}>{msg}</p>
+        ) : (
+          <form onSubmit={submit} className="auth-form" noValidate>
+            {forgot ? (
+              <div className="auth-field">
+                <label htmlFor="rec-email">Email</label>
+                <input id="rec-email" type="email" value={email} maxLength={254} autoComplete="email"
+                       onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+              </div>
+            ) : (
+              <>
+                <div className="auth-field">
+                  <label htmlFor="rec-pw">New password</label>
+                  <input id="rec-pw" type="password" value={password} maxLength={128} autoComplete="new-password"
+                         onChange={(e) => setPassword(e.target.value)} />
+                </div>
+                <div className="auth-field">
+                  <label htmlFor="rec-pw2">Confirm new password</label>
+                  <input id="rec-pw2" type="password" value={confirm} maxLength={128} autoComplete="new-password"
+                         onChange={(e) => setConfirm(e.target.value)} />
+                </div>
+              </>
+            )}
+            <button type="submit" className="auth-submit-btn" disabled={loading}>
+              {loading ? <span className="auth-spinner"></span> : forgot ? "Email me a reset link" : "Save password and sign in"}
+            </button>
+          </form>
+        )}
+        <div className="auth-footer">
+          <p><button type="button" className="auth-link-btn" onClick={() => setAuthModalMode("login")}>Back to sign in</button></p>
         </div>
       </div>
     </div>

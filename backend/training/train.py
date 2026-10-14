@@ -18,12 +18,12 @@ from importlib.metadata import PackageNotFoundError, version
 import joblib
 import numpy as np
 from scipy.sparse import issparse
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
 from core import jobs, store
 from preprocessing import advanced, execute
-from training import models
+from training import ensembles, models
 from training import params as P
 from training.metrics import METRICS, TASK_METRICS, adjusted_r2, score, scorers, summary
 from training.pipeline import Prep, build_pipeline, fit_fold, input_schema
@@ -63,11 +63,16 @@ def load_context(ds_id):
         raise ValueError("The data was cleaned again after preprocessing - run preprocessing again.")
     s, target = fitted["settings"], fitted["target"]
     task = s["task"]
-    df, feats, _, notes = execute.prepare_rows(df, target, s["columns"], task)
+    if task == "clustering":
+        raise ValueError("This data was preprocessed for clustering - use the clustering models.")
+    group = s.get("group")
+    df, feats, _, notes = execute.prepare_rows(df, target, s["columns"], task, group)
+    groups = df[group] if group else None
     X_tr, X_te, y_tr, y_te, _ = execute.split(df[feats], df[target], task, s["test_size"],
-                                              s["random_state"], s.get("stratify", True))
+                                              s["random_state"], s.get("stratify", True), groups)
     ctx = {"target": target, "task": task, "prep": s, "seed": s["random_state"], "notes": notes,
-           "X_tr": X_tr, "X_te": X_te, "classes": None, "clean_ops": fitted["clean_ops"], "features": feats}
+           "X_tr": X_tr, "X_te": X_te, "classes": None, "clean_ops": fitted["clean_ops"], "features": feats,
+           "groups_tr": None if groups is None else groups.loc[X_tr.index].to_numpy()}
     if task == "classification":
         enc = LabelEncoder().fit(df[target].astype(str))
         ctx["classes"] = [str(c) for c in enc.classes_]
@@ -75,6 +80,18 @@ def load_context(ds_id):
     else:
         ctx["y_tr"], ctx["y_te"] = y_tr.to_numpy(dtype=float), y_te.to_numpy(dtype=float)
     return ctx
+
+
+def cv_splits(ctx, folds):
+    """The CV folds every run, search and curve uses: stratified for classification,
+    shuffled with the run seed; with a group column, whole groups per fold."""
+    seed, groups = ctx["seed"], ctx.get("groups_tr")
+    clf = ctx["task"] == "classification"
+    if groups is not None:
+        cv = (StratifiedGroupKFold if clf else GroupKFold)(n_splits=folds, shuffle=True, random_state=seed)
+        return list(cv.split(ctx["X_tr"], ctx["y_tr"], groups))
+    cv = (StratifiedKFold if clf else KFold)(n_splits=folds, shuffle=True, random_state=seed)
+    return list(cv.split(ctx["X_tr"], ctx["y_tr"]))
 
 
 def fingerprint(ctx, folds):
@@ -115,6 +132,8 @@ def options(ds_id):
     else:
         primary = ("f1" if binary else "balanced_accuracy") if f["imbalanced"] else "accuracy"
         folds_max = min(MAX_FOLDS, min(f["class_counts"].values()))
+    if ctx.get("groups_tr") is not None:
+        folds_max = min(folds_max, len(set(ctx["groups_tr"])))
     listed = []
     for key, row in rows.items():
         reason = models.incompatible(row, f)
@@ -126,7 +145,7 @@ def options(ds_id):
                        "params": [{**p, "default": defaults[p["name"]]} for p in row["params"]]})
     return {"task": task, "target": ctx["target"], "classes": ctx["classes"], "notes": ctx["notes"], "facts": f,
             "fingerprint": fingerprint(ctx, None),
-            "models": listed,
+            "models": listed, "ensembles": ensembles.KINDS[task], "group": ctx["prep"].get("group"),
             "metrics": [{"key": m, "label": METRICS[m][0], "higher_is_better": METRICS[m][1]}
                         for m in TASK_METRICS[task]],
             "defaults": {"primary_metric": primary, "folds": DEFAULT_FOLDS,
@@ -144,7 +163,9 @@ def validate(ds_id, payload, kind="train"):
     by_key = {m["key"]: m for m in opt["models"]}
     rows = models.table(opt["task"])
     chosen = [k for k in dict.fromkeys(payload.get("models") or []) if k != "baseline"]
-    if not chosen:
+    ens = ensembles.validate(opt["task"], payload.get("ensembles"), rows,
+                             {m["key"]: m["compatible"] for m in opt["models"]}, bool(opt["group"]))
+    if not chosen and not ens:
         raise ValueError("Pick at least one model to train.")
     for k in chosen:
         if k not in by_key:
@@ -174,14 +195,15 @@ def validate(ds_id, payload, kind="train"):
             raise ValueError(f"Positive class '{positive}' is not a class of {opt['target']}.")
     user_params = payload.get("params") or {}
     chosen_params = {}
-    for k in chosen:
+    members = [m for e in ens for m in e["members"]]
+    for k in dict.fromkeys(chosen + members):
         _kwargs, fit, record = P.resolve(rows[k], user_params.get(k))
-        if fit.get("early_stopping") and share == 0:
+        if fit.get("early_stopping") and share == 0 and k in chosen:
             raise ValueError(f"{rows[k]['label']}: early stopping needs a validation share above 0.")
         chosen_params[k] = record
     return {"kind": kind, "target": opt["target"], "task": opt["task"], "models": chosen, "folds": folds,
             "primary_metric": primary, "positive_class": positive, "time_limit_s": minutes * 60,
-            "validation_share": share, "params": chosen_params}
+            "validation_share": share, "params": chosen_params, "ensembles": ens}
 
 
 def _rank(rec, metric, higher):
@@ -246,16 +268,19 @@ def run(job, ds_id, settings):
     f = facts(ctx)
     task, folds, seed = ctx["task"], settings["folds"], ctx["seed"]
     share = settings.get("validation_share", VALIDATION_SHARE)
-    rows = models.table(task)
+    rows = dict(models.table(task))
+    for e in settings.get("ensembles") or []:   # an ensemble is one more row, built from its members
+        member_kwargs = {m: P.resolve(rows[m], settings["params"].get(m))[0] for m in e["members"]}
+        rows[e["key"]] = ensembles.row(task, e, rows, member_kwargs)
     X_tr, y_tr, X_te, y_te = ctx["X_tr"], ctx["y_tr"], ctx["X_te"], ctx["y_te"]
+    groups = ctx.get("groups_tr")
     n_classes = len(ctx["classes"] or [])
     classes = np.arange(n_classes) if task == "classification" else None
     pos = ctx["classes"].index(settings["positive_class"]) if settings.get("positive_class") else None
     primary = settings["primary_metric"]
     higher = METRICS[primary][1]
-    cv = (StratifiedKFold if task == "classification" else KFold)(n_splits=folds, shuffle=True, random_state=seed)
-    splits = list(cv.split(X_tr, y_tr))
-    keys = ["baseline"] + settings["models"]
+    splits = cv_splits(ctx, folds)
+    keys = ["baseline"] + settings["models"] + [e["key"] for e in settings.get("ensembles") or []]
     imb = advanced._m("imbalance", ctx["prep"]["pipeline"] or {})
     total, done, t0 = len(keys) * (folds + 1), 0, time.time()
     results = {"task": task, "target": ctx["target"], "classes": ctx["classes"],
@@ -277,7 +302,8 @@ def run(job, ds_id, settings):
             pipe = build_pipeline(ctx, key, row, f, folds, kwargs)
             if key != "baseline" and imb == "class_weights" and not row["balanced"]:
                 rec["note"] = "class weights not supported by this model - trained without them"
-            sc = scorers(task, n_classes, pos, hasattr(pipe, "predict_proba"), f.get("target_has_zero", False))
+            sc = scorers(task, n_classes, pos, hasattr(pipe, "predict_proba"), f.get("target_has_zero", False),
+                         hasattr(pipe, "decision_function"))
             log = _EpochLog(job, key) if row["epochs"] else None
             fold_scores = {name: [] for name in sc}
             fit_times, n_val, n_feat, train_fold = [], [], [], []
@@ -290,9 +316,10 @@ def run(job, ds_id, settings):
                 if log:
                     log.start(f"fold {k + 1}" if tr is not None else "final", progress)
                 rows_X, rows_y = (X_tr.iloc[tr], y_tr[tr]) if tr is not None else (X_tr, y_tr)
+                rows_g = None if groups is None else (groups[tr] if tr is not None else groups)
                 t = time.time()
                 fitted, info = fit_fold(pipe, row, fit, rows_X, rows_y, share, seed, task,
-                                        log or (lambda *a: None), job.check, classes)
+                                        log or (lambda *a: None), job.check, classes, rows_g)
                 fit_times.append(time.time() - t)
                 if log:
                     log.flush()
@@ -388,8 +415,10 @@ def runs(ds_id):
         primary = res.get("primary_metric")
         out.append({"run_id": status["run_id"], "state": status.get("state"), "created": status.get("created"),
                     "kind": settings.get("kind"), "primary_metric": primary, "fingerprint": res.get("fingerprint"),
+                    "primary_label": METRICS.get(primary, (primary,))[0] if primary else None,
                     "best": res.get("best"), "size_mb": store.size_mb(path),
-                    "models": [{"key": k, "label": r["label"], "baseline": r["baseline"], "error": r.get("error"),
+                    "task": res.get("task"),
+                    "models": [{"key": k, "label": r["label"], "baseline": r.get("baseline", False), "error": r.get("error"),
                                 "cv": (r.get("cv") or {}).get(primary, {}).get("mean"),
                                 "test": (r.get("test") or {}).get(primary)}
                                for k, r in (res.get("models") or {}).items()]})

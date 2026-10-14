@@ -3,18 +3,26 @@ All optional -- a down LLM returns 503 and the rest of the app keeps working."""
 
 import json
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
+from api.auth import owner_guard
 from api.common import frame_or_404
 from assistant import llm, results
 from training.metrics import METRICS
 from preprocessing.profiler import profile_dataset
 
-router = APIRouter()
+
+router = APIRouter(dependencies=[Depends(owner_guard)])  # signed in + owns the dataset
 
 SAMPLE_SEED = 0         # our starting point: same rows every time, so the same data gives the same prompt
 MAX_CELL_CHARS = 300    # our starting point: long text cells are shortened so a text column can't fill the window
+# our starting point: the row sample's JSON length. Measured 2026-10-15: 96 rows of the
+# 31-column breast-cancer data were 43,503 tokens (every row repeats every column name) and
+# Ollama refused them at its 16,384-token window; this budget keeps the sample to a few
+# thousand tokens whatever the width.
+SAMPLE_CHARS = 12_000
+MIN_SAMPLE_ROWS = 5     # our starting point: fewer rows than this say too little
 
 
 def _short(v):
@@ -23,9 +31,10 @@ def _short(v):
 
 def _llm_context(df, profile, target, task):
     """Aggregated metadata + a small real-row sample for the LLM planner.
-    Never raw full data: sample rows are capped by width so a wide table can't
-    blow the model's context window (~100 rows, fewer for many columns). Rows are
-    a seeded random sample -- the first rows of a sorted file would mislead."""
+    Never raw full data: the sample is capped by width (~100 rows, fewer for many
+    columns) and then halved until its JSON fits SAMPLE_CHARS, so a wide table can't
+    blow the model's context window. Rows are a seeded random sample -- the first
+    rows of a sorted file would mislead."""
     ncols = max(1, len(df.columns))
     n = min(100, max(10, 3000 // ncols))
     info = profile["columns_info"]
@@ -33,8 +42,13 @@ def _llm_context(df, profile, target, task):
              "missing_percent": info[c]["missing_percent"],
              "unique": info[c]["unique_values"]} for c in df.columns]
     examples = {c: [_short(str(v)) for v in df[c].dropna().unique()[:8]] for c in df.columns}
-    rows = df.sample(n=n, random_state=SAMPLE_SEED).sort_index() if len(df) > n else df
-    sample = json.loads(rows.map(_short).to_json(orient="records"))
+    while True:
+        rows = df.sample(n=n, random_state=SAMPLE_SEED).sort_index() if len(df) > n else df
+        text = rows.map(_short).to_json(orient="records")
+        if len(text) <= SAMPLE_CHARS or n <= MIN_SAMPLE_ROWS:
+            break
+        n = max(MIN_SAMPLE_ROWS, n // 2)
+    sample = json.loads(text)
     return {"target": target, "task": task, "columns": cols,
             "examples": examples, "sample": sample}
 

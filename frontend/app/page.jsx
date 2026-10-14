@@ -1,9 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
+import Admin from "./admin";
+import Bibliometrics from "./biblio";
 import Charts from "./charts";
-import TargetPicker from "./target";
+import Dashboard from "./dashboard";
+import Projects from "./projects";
+import ReportPanel from "./reportpanel";
+import Statistics from "./stats";
+import TargetPicker, { derivedTask } from "./target";
 import EdaGallery from "./eda";
 import ChartBuilder from "./builder";
 import Clean from "./clean";
@@ -13,7 +19,9 @@ import ChatPanel from "./chat";
 import Landing from "./landing";
 import DatasetUpload from "./upload";
 import DatasetPreview from "./preview";
-import { API } from "./apiclient";
+import Icon from "./icons";
+import { STEPS, StepFooter, StepHeader, StepRail, pipelineState, stepLabel } from "./workflow";
+import { API, call } from "./apiclient";
 import { AuthProvider, useAuth } from "./authcontext";
 import AuthModal from "./authmodal";
 
@@ -25,8 +33,8 @@ const ISSUE_META = {
   outliers: { label: "Outliers", rec: "IQR clip, z-score, or winsorize" },
   constant_columns: { label: "Constant columns", rec: "Drop (zero variance, no signal)" },
   id_columns: { label: "Possible ID columns", rec: "Exclude from modeling (leaks / no signal)" },
-  high_cardinality: { label: "High-cardinality columns", rec: "Text-encode (TF-IDF + SVD) in Preprocessing — kept, not dropped" },
-  value_issues: { label: "Value issues", rec: "Convert numbers-stored-as-text, review negatives/zeros" },
+  high_cardinality: { label: "High-cardinality columns", rec: "Free text: encode as text (word + letter TF-IDF) in Preprocessing; many-valued labels: drop or group them" },
+  value_issues: { label: "Value issues", rec: "Convert numbers stored as text; review negatives / zeros (zeros can be marked as missing on the Cleaning tab)" },
   consistency_issues: { label: "Inconsistent categories", rec: "Normalize spellings (Male / male / \" Male\")" },
 };
 
@@ -37,26 +45,39 @@ const VALUE_ISSUE_LABEL = {
   whitespace_values: "Leading/trailing whitespace",
 };
 
+// Pages that are not pipeline steps, for the header.
+const PAGE_LABEL = { dashboard: "Dashboard", projects: "Projects", upload: "New dataset", biblio: "Bibliometrics",
+                     admin: "Accounts", statistics: "Statistics" };
+const PIPELINE = STEPS.map((s) => s.key);
+const CHAT_DOCK_MIN = 1360; // px: below this the AI panel starts closed so the step keeps its width
+
 const num = (v) =>
   typeof v === "number" ? v.toLocaleString(undefined, { maximumFractionDigits: 3 }) : v ?? "—";
 
 function StudioApp() {
   const { user, logout, openAuthModal, isLoading } = useAuth();
   const [viewMode, setViewMode] = useState("landing");
-  const [activeTab, setActiveTab] = useState("upload");
+  const [activeTab, setActiveTab] = useState("dashboard");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [file, setFile] = useState(null);
   const [datasetName, setDatasetName] = useState("");
   const [taskType, setTaskType] = useState("auto");
+  const [taskChoice, setTaskChoice] = useState("auto"); // the Target picker's task (auto = from the target's type)
+  const [biblioId, setBiblioId] = useState(null);
   const [target, setTarget] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  // What the user has finished in the open project (drives Next and the sidebar track).
+  // prepFor: the target the stored preprocessing was fitted for ("" = clustering).
+  const [progress, setProgress] = useState({});
+  const [chatOpen, setChatOpen] = useState(true);
   // Upload limits come from the backend (MAX_UPLOAD_MB in backend/.env), never a copy here.
   // If they can't be loaded the quick check is skipped -- the backend still enforces them.
   const [limits, setLimits] = useState(null);
   useEffect(() => {
     fetch(`${API}/api/upload/limits`).then((r) => (r.ok ? r.json() : null)).then(setLimits).catch(() => {});
+    setChatOpen(window.innerWidth >= CHAT_DOCK_MIN);
   }, []);
 
   // Enforce mandatory registration/login for accessing the studio
@@ -66,6 +87,18 @@ function StudioApp() {
       openAuthModal("login");
     }
   }, [user, isLoading, viewMode, openAuthModal]);
+
+  // Looking at a step is what finishes Preview and Explore.
+  useEffect(() => {
+    const key = activeTab === "preview" ? "preview" : activeTab === "eda" ? "eda" : null;
+    if (key && result && !progress[key]) setProgress((p) => ({ ...p, [key]: true }));
+  }, [activeTab, result, progress]);
+
+  const clustering = taskChoice === "clustering";
+  const hasTarget = !!target || clustering;
+  // preprocessing (and the runs made from it) only count for the target it was fitted for
+  const prepValid = !!progress.preprocess && (progress.prepFor ?? "") === (clustering ? "" : target);
+  const { done, locked } = pipelineState({ ...progress, preprocess: prepValid, train: prepValid && progress.train }, hasTarget);
 
   function pick(f) {
     setError("");
@@ -93,42 +126,87 @@ function StudioApp() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch(`${API}/api/analyze`, { method: "POST", body: form });
-      if (!res.ok) {
-        let detail = `Server error ${res.status}`;
-        try {
-          const j = await res.json();
-          if (j.detail) detail = j.detail;
-        } catch {}
-        throw new Error(detail);
+      const data = await call("/api/analyze", form);
+      if (datasetName.trim() && datasetName.trim() !== data.title) {
+        try { data.title = (await call(`/api/projects/${data.id}`, { title: datasetName.trim() }, "PATCH")).title; } catch {}
       }
-      const data = await res.json();
       setResult(data);
-      setActiveTab("preview");
+      setProgress({});
+      setTarget("");
+      setTaskChoice(taskType === "auto" ? "auto" : taskType);
+      switchTab("preview");
     } catch (e) {
-      setError(
-        e instanceof TypeError
-          ? `Cannot reach the backend at ${API}. Is it running? (uvicorn app:app --reload)`
-          : e.message
-      );
+      setError(e.message.startsWith("Cannot reach") ? `${e.message} Is it running? (uvicorn app:app --reload)` : e.message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  // a sample dataset bundled with scikit-learn, created on the server
+  async function loadSample(key, task) {
+    setError("");
+    setLoading(true);
+    try {
+      const data = await call(`/api/samples/${key}`, {});
+      setResult(data);
+      setProgress({});
+      setDatasetName(data.title);
+      setTarget(data.suggested?.target || "");
+      setTaskChoice(task === "classification" || task === "regression" ? "auto" : task);
+      switchTab("preview");
+    } catch (e) {
+      setError(e.message);
+      switchTab("upload");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // reopen a saved project where it was left: its current table + last target / task
+  async function openProject(p) {
+    setError("");
+    if (p.kind === "bibliometric") { setBiblioId(p.id); switchTab("biblio"); return; }
+    try {
+      const data = await call(`/api/projects/${p.id}`);
+      setResult(data);
+      setDatasetName(data.title);
+      setTarget(data.restore?.target || "");
+      setTaskChoice(data.restore?.task || "auto");
+      // a stored preprocessing means the steps before it were finished last time
+      setProgress(data.restore
+        ? { preview: true, clean: true, eda: true, preprocess: true, prepFor: data.restore.target || "", train: p.runs > 0 }
+        : { preview: true });
+      switchTab(data.restore ? (p.runs > 0 ? "training" : "preprocessing") : "insights");
+    } catch (e) {
+      setError(e.message);
+      switchTab("upload");
     }
   }
 
   function reset() {
     setFile(null);
     setResult(null);
+    setProgress({});
     setDatasetName("");
     setTarget("");
+    setTaskChoice("auto");
     setError("");
-    setActiveTab("upload");
+    switchTab("upload");
   }
 
   function switchTab(t) {
     setActiveTab(t);
     setMobileNavOpen(false);
+    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top: 0, behavior: still ? "auto" : "smooth" });
   }
+
+  function goStep(key) {
+    if (!result || locked[key]) return;
+    switchTab(key);
+  }
+
+  const mark = (key, value = true) => setProgress((p) => ({ ...p, [key]: value }));
 
   if (viewMode === "landing") {
     return (
@@ -147,219 +225,163 @@ function StudioApp() {
     );
   }
 
+  const isStep = PIPELINE.includes(activeTab);
+  const stepNow = STEPS.find((s) => s.key === activeTab);
+  const task = clustering ? "clustering" : "";
+  const nextStep = STEPS.find((s) => !done[s.key]) || STEPS[STEPS.length - 1];
+  const navItem = (key, icon, label, opts = {}) => (
+    <button type="button" className={`nav-item ${activeTab === key ? "is-active" : ""}`}
+            aria-current={activeTab === key ? "page" : undefined}
+            disabled={opts.disabled} title={opts.title} onClick={() => switchTab(key)}>
+      <Icon name={icon} size={18} />
+      <span>{label}</span>
+    </button>
+  );
+
   return (
     <div className="studio-app-shell">
-      {/* Mobile Drawer Backdrop */}
       {mobileNavOpen && (
-        <div
-          className="studio-sidebar-backdrop"
-          onClick={() => setMobileNavOpen(false)}
-          aria-hidden="true"
-        />
+        <div className="studio-sidebar-backdrop" onClick={() => setMobileNavOpen(false)} aria-hidden="true" />
       )}
 
-      {/* Sidebar matching reference dashboard */}
-      <aside className={`studio-sidebar ${mobileNavOpen ? "mobile-open" : ""}`}>
-        <div className="sidebar-brand" onClick={() => { setViewMode("landing"); setMobileNavOpen(false); }}>
-          <div className="brand-icon-box small">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path d="M12 2v8M4.93 10.93 9.17 15.17M2 18h20M20 18v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2M7 14h10l-2-4H9l-2 4Z" />
-            </svg>
-          </div>
-          <div className="sidebar-brand-text">
-            <span className="sidebar-brand-name">Model Forge</span>
-            <span className="sidebar-brand-tag">Studio</span>
-          </div>
-        </div>
-
-        <nav className="sidebar-nav">
-          <div className="sidebar-nav-section">INGESTION</div>
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "upload" ? "active" : ""}`}
-            onClick={() => switchTab("upload")}
-          >
-            <span className="nav-btn-icon">📂</span>
-            <span className="nav-btn-text">Upload Dataset</span>
-            {file && <span className="nav-pill-dot green" title="Dataset selected"></span>}
-          </button>
-
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "preview" ? "active" : ""}`}
-            onClick={() => result && switchTab("preview")}
-            disabled={!result}
-          >
-            <span className="nav-btn-icon">👁️</span>
-            <span className="nav-btn-text">Dataset Preview</span>
-            {!result && <span className="nav-lock-badge">🔒</span>}
-          </button>
-
-          <div className="sidebar-nav-section">ML PIPELINE</div>
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "insights" ? "active" : ""}`}
-            onClick={() => result && switchTab("insights")}
-            disabled={!result}
-          >
-            <span className="nav-btn-icon">🛡️</span>
-            <span className="nav-btn-text">Quality Audit</span>
-            {!result && <span className="nav-lock-badge">🔒</span>}
-          </button>
-
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "cleaning" ? "active" : ""}`}
-            onClick={() => result && switchTab("cleaning")}
-            disabled={!result}
-          >
-            <span className="nav-btn-icon">🧹</span>
-            <span className="nav-btn-text">Data Cleaning</span>
-            {!result && <span className="nav-lock-badge">🔒</span>}
-          </button>
-
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "eda" ? "active" : ""}`}
-            onClick={() => result && switchTab("eda")}
-            disabled={!result}
-          >
-            <span className="nav-btn-icon">📊</span>
-            <span className="nav-btn-text">Visual EDA</span>
-            {!result && <span className="nav-lock-badge">🔒</span>}
-          </button>
-
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "preprocessing" ? "active" : ""}`}
-            onClick={() => result && switchTab("preprocessing")}
-            disabled={!result}
-          >
-            <span className="nav-btn-icon">⚙️</span>
-            <span className="nav-btn-text">ML Preprocessing</span>
-            {!result && <span className="nav-lock-badge">🔒</span>}
-          </button>
-
-          <button
-            type="button"
-            className={`sidebar-nav-btn ${activeTab === "training" ? "active" : ""}`}
-            onClick={() => result && switchTab("training")}
-            disabled={!result}
-          >
-            <span className="nav-btn-icon">🧠</span>
-            <span className="nav-btn-text">Model Training</span>
-            {!result && <span className="nav-lock-badge">🔒</span>}
-          </button>
-        </nav>
-
-        <div className="sidebar-footer">
-          <button
-            type="button"
-            className="btn-sidebar-back"
-            onClick={() => { setViewMode("landing"); setMobileNavOpen(false); }}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path d="M19 12H5M12 19l-7-7 7-7" />
-            </svg>
-            <span>Back to Home</span>
-          </button>
-        </div>
-      </aside>
-
-      {/* Main Studio Content Area */}
-      <main className="studio-main-viewport">
-        {/* Top Header */}
-        <header className="studio-header-strip">
-          <div className="header-left-cluster">
-            <button
-              type="button"
-              className="btn-mobile-menu-toggle"
-              onClick={() => setMobileNavOpen((o) => !o)}
-              aria-label="Toggle navigation menu"
-            >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                {mobileNavOpen ? (
-                  <path d="M18 6 6 18M6 6l12 12" />
-                ) : (
-                  <path d="M4 6h16M4 12h16M4 18h16" />
-                )}
+      <aside className={`sidebar ${mobileNavOpen ? "is-open" : ""}`} aria-label="Studio navigation">
+        <div className="sb-top">
+          <button type="button" className="sb-brand" onClick={() => switchTab("dashboard")}>
+            <span className="sb-logo">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
+                <path d="M12 2v8M4.93 10.93 9.17 15.17M2 18h20M20 18v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2M7 14h10l-2-4H9l-2 4Z" />
               </svg>
-            </button>
+            </span>
+            <span className="sb-brand-name">Model Forge</span>
+          </button>
+          <button type="button" className="icon-btn sb-close" onClick={() => setMobileNavOpen(false)} aria-label="Close navigation">
+            <Icon name="x" size={18} />
+          </button>
+        </div>
 
-            <div className="header-breadcrumbs">
-              <span className="bc-home" onClick={() => setViewMode("landing")}>Model Forge</span>
-              <span className="bc-divider">/</span>
-              <span className="bc-active">
-                {activeTab === "upload" || !result
-                  ? "Dataset Ingestion"
-                  : `${result.filename} · ${
-                      activeTab === "preview"
-                        ? "Dataset Preview"
-                        : activeTab === "insights"
-                        ? "Quality Audit"
-                        : activeTab === "cleaning"
-                        ? "Data Cleaning"
-                        : activeTab === "eda"
-                        ? "Visual EDA"
-                        : activeTab === "training"
-                        ? "Model Training"
-                        : "ML Preprocessing"
-                    }`}
-              </span>
-            </div>
+        <nav className="sb-nav">
+          <div className="sb-group">
+            <p className="sb-label">Workspace</p>
+            {navItem("dashboard", "dashboard", "Dashboard")}
+            {navItem("projects", "folder", "Projects")}
+            {navItem("upload", "upload", "New dataset")}
           </div>
 
-          <div className="header-status-area">
-            {result && (
-              <div className="loaded-dataset-chip">
-                <span>📄 {result.filename}</span>
-                <span className="chip-count">({result.profile?.rows} rows)</span>
-              </div>
-            )}
-            {result && target && (
-              <div
-                className="loaded-dataset-chip"
-                style={{ cursor: "pointer", borderColor: "rgba(194, 110, 56, 0.4)" }}
-                onClick={() => {
-                  setActiveTab("insights");
-                  window.scrollTo({ top: 0, behavior: "smooth" });
-                }}
-                title="Click to view or edit target in Quality Audit"
-              >
-                <span>🎯 <b>{target}</b></span>
-              </div>
-            )}
-            {user && (
-              <div className="user-nav-profile" style={{ marginLeft: "6px" }}>
-                <div className="user-avatar-circle" style={{ width: "24px", height: "24px", fontSize: "11px" }}>
-                  {user.avatar_url ? (
-                    <img src={user.avatar_url} alt={user.full_name || user.email} />
-                  ) : (
-                    <span>{(user.full_name || user.email || "U")[0].toUpperCase()}</span>
-                  )}
-                </div>
-                <span className="user-nav-name" style={{ fontSize: "12px", maxWidth: "110px" }}>
-                  {user.full_name || user.email.split("@")[0]}
-                </span>
-                <button
-                  type="button"
-                  className="btn-sign-out"
-                  onClick={() => {
-                    logout();
-                    setViewMode("landing");
-                  }}
-                  title="Sign Out"
-                >
-                  Sign Out
+          <div className="sb-group">
+            <p className="sb-label">Pipeline</p>
+            {result ? (
+              <>
+                <p className="sb-project" title={result.title || result.filename}>
+                  <Icon name="table" size={15} />
+                  <span>{result.title || result.filename}</span>
+                </p>
+                <StepRail current={isStep ? activeTab : null} done={done} locked={locked} task={task} onGo={goStep} />
+              </>
+            ) : (
+              <div className="sb-empty">
+                <p>Open a project or upload a dataset to start the guided pipeline.</p>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => switchTab("upload")}>
+                  <Icon name="plus" size={15} /> New dataset
                 </button>
               </div>
             )}
           </div>
+
+          <div className="sb-group">
+            <p className="sb-label">Tools</p>
+            {navItem("statistics", "sigma", "Statistics", { disabled: !result, title: result ? undefined : "Open a dataset first" })}
+            {navItem("biblio", "network", "Bibliometrics")}
+          </div>
+
+          {user?.role === "admin" && (
+            <div className="sb-group">
+              <p className="sb-label">Administration</p>
+              {navItem("admin", "users", "Accounts")}
+            </div>
+          )}
+        </nav>
+
+        <div className="sb-foot">
+          {user && (
+            <div className="sb-user">
+              <span className="avatar">
+                {user.avatar_url ? <img src={user.avatar_url} alt="" /> : (user.full_name || user.email || "U")[0].toUpperCase()}
+              </span>
+              <span className="sb-user-text">
+                <b>{user.full_name || user.email.split("@")[0]}</b>
+                <span>{user.role === "admin" ? "Administrator" : user.email}</span>
+              </span>
+              <button type="button" className="icon-btn" title="Sign out" aria-label="Sign out"
+                      onClick={() => { logout(); setViewMode("landing"); }}>
+                <Icon name="logOut" size={17} />
+              </button>
+            </div>
+          )}
+          <button type="button" className="sb-home" onClick={() => { setViewMode("landing"); setMobileNavOpen(false); }}>
+            <Icon name="home" size={15} /> Home page
+          </button>
+        </div>
+      </aside>
+
+      <main className="studio-main-viewport">
+        <header className="topbar">
+          <button type="button" className="icon-btn topbar-menu" onClick={() => setMobileNavOpen((o) => !o)}
+                  aria-label="Open navigation" aria-expanded={mobileNavOpen}>
+            <Icon name="menu" size={20} />
+          </button>
+          <nav className="crumbs" aria-label="Breadcrumb">
+            <button type="button" onClick={() => switchTab("dashboard")}>Dashboard</button>
+            {(isStep || activeTab === "statistics") && result ? (
+              <>
+                <span aria-hidden="true">/</span>
+                <span className="crumb-project" title={result.title || result.filename}>{result.title || result.filename}</span>
+                <span aria-hidden="true">/</span>
+                <b>{isStep ? stepLabel(stepNow, task) : PAGE_LABEL.statistics}</b>
+              </>
+            ) : activeTab !== "dashboard" && (
+              <>
+                <span aria-hidden="true">/</span>
+                <b>{PAGE_LABEL[activeTab] || stepNow?.label}</b>
+              </>
+            )}
+          </nav>
+          <div className="topbar-right">
+            {result && (
+              <span className="chip" title={result.filename}>
+                <Icon name="table" size={14} />
+                {result.profile?.rows?.toLocaleString()} × {result.profile?.columns}
+              </span>
+            )}
+            {result && (target || clustering) && (
+              <button type="button" className="chip chip-accent" onClick={() => goStep("insights")}
+                      title="Change the target on the quality audit">
+                <Icon name="target" size={14} />
+                <span>{clustering ? "Clustering" : target}</span>
+              </button>
+            )}
+          </div>
         </header>
 
-        {/* Content Container */}
-        <div className="studio-view-canvas">
-          {activeTab === "upload" || !result ? (
+        <div className={`studio-view-canvas ${isStep || activeTab === "statistics" ? "is-wide" : ""}`}>
+          {activeTab === "dashboard" ? (
+            <Dashboard
+              user={user}
+              samples={limits?.samples}
+              current={result && { title: result.title || result.filename, done: STEPS.filter((s) => done[s.key]).length,
+                                   total: STEPS.length, next: stepLabel(nextStep, task) }}
+              onContinue={() => switchTab(nextStep.key)}
+              onOpen={openProject}
+              onNew={() => switchTab("upload")}
+              onSample={loadSample}
+              onGo={switchTab}
+            />
+          ) : activeTab === "projects" ? (
+            <Projects onOpen={openProject} />
+          ) : activeTab === "biblio" ? (
+            <Bibliometrics id={biblioId} onOpened={(r) => setBiblioId(r?.id || null)} />
+          ) : activeTab === "admin" && user?.role === "admin" ? (
+            <Admin me={user} />
+          ) : activeTab === "upload" || !result ? (
             <DatasetUpload
               file={file}
               setFile={pick}
@@ -372,27 +394,30 @@ function StudioApp() {
               onAnalyze={analyze}
               onReset={reset}
               limits={limits}
+              onSample={loadSample}
             />
           ) : activeTab === "preview" ? (
-            <DatasetPreview
+            <>
+              <StepHeader stepKey="preview" done={done} task={task} />
+              <DatasetPreview data={result} target={target} setTarget={setTarget} />
+              <StepFooter stepKey="preview" done={done} task={task} onGo={goStep} />
+            </>
+          ) : (
+            <Report
               data={result}
-              onProceed={() => setActiveTab("insights")}
-              onClean={() => setActiveTab("cleaning")}
+              setData={setResult}
+              tab={activeTab}
+              setTab={goStep}
               target={target}
               setTarget={setTarget}
+              taskChoice={taskChoice}
+              setTaskChoice={setTaskChoice}
+              done={done}
+              mark={mark}
+              chatOpen={chatOpen}
+              setChatOpen={setChatOpen}
+              onDashboard={() => switchTab("dashboard")}
             />
-          ) : (
-            <div className="wrap wide" style={{ padding: "16px 0 60px" }}>
-              <Report
-                data={result}
-                setData={setResult}
-                onReset={reset}
-                tab={activeTab}
-                setTab={setActiveTab}
-                target={target}
-                setTarget={setTarget}
-              />
-            </div>
           )}
         </div>
       </main>
@@ -403,7 +428,8 @@ function StudioApp() {
 
 // ---------------------------------------------------------------------------
 
-function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveTabProp, target: targetProp, setTarget: setTargetProp }) {
+function Report({ data, setData, tab, setTab, target, setTarget, taskChoice = "auto", setTaskChoice,
+                  done, mark, chatOpen, setChatOpen, onDashboard }) {
   const { profile, report, filename } = data;
   const info = profile.columns_info;
   const checks = report.checks;
@@ -412,18 +438,11 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
   const semType = {};
   for (const c of checks.column_types.columns) semType[c.column] = c.detected_type;
 
-  const [localTarget, setLocalTarget] = useState("");
-  const target = targetProp !== undefined ? targetProp : localTarget;
-  const setTarget = setTargetProp || setLocalTarget;
-  const task = !target
-    ? ""
-    : semType[target] === "numeric"
-      ? "regression"
-      : "classification"; // boolean/categorical (and anything else) -> classification
-
-  const [localTab, setLocalTab] = useState("insights");
-  const tab = activeTabProp || localTab;
-  const setTab = setActiveTabProp || setLocalTab;
+  // the user's choice wins; "auto" follows the target's type (numeric -> regression)
+  const task = taskChoice === "clustering" ? "clustering"
+    : !target ? ""
+    : taskChoice !== "auto" ? taskChoice
+    : derivedTask(semType, target);
 
   // LLM plan (clean + preprocess suggestions). Optional overlay: on failure the
   // tabs fall back to rule-based defaults. Fetched once per dataset.
@@ -441,32 +460,22 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
     setPlan(null);          // never show or apply the previous target's plan while the new one loads
     setPlanLoading(true);
     setPlanErr("");
-    fetch(`${API}/api/plan`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: data.id, target, task }),
-    })
-      .then(async (r) => {
-        if (!r.ok) {
-          let d = `Error ${r.status}`;
-          try { const j = await r.json(); if (j.detail) d = j.detail; } catch {}
-          throw new Error(d);
-        }
-        return r.json();
-      })
+    call("/api/plan", { id: data.id, target, task: task === "clustering" ? "classification" : task })
       .then((p) => { if (!cancel) setPlan(p); })
-      .catch((e) => { if (!cancel) setPlanErr(e instanceof TypeError ? "backend unreachable" : e.message); })
+      .catch((e) => { if (!cancel) setPlanErr(e.message); })
       .finally(() => { if (!cancel) setPlanLoading(false); });
     return () => { cancel = true; };
     // refetch when the user picks/changes the target so the AI refines its plan
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data.id, target]);
 
-  // Cleaning replaces the stored frame; refresh everything with the cleaned data.
-  function onCleaned(fresh) {
+  // The table changed (cleaning, or reverse scoring on Statistics): refresh everything,
+  // and the stored preprocessing no longer matches the table -- it has to run again.
+  function onDataChanged(fresh) {
     setData(fresh);
     setRev((r) => r + 1);
-    // User remains on the Data Cleaning page to review results and decides when to move on
+    mark("preprocess", false);
+    mark("train", false);
   }
 
   const { score, grade, deductions } = report.quality_score;
@@ -482,88 +491,67 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
     URL.revokeObjectURL(url);
   }
 
+  const isStep = tab !== "statistics";
+  const chatToggle = (
+    <button type="button" className="btn btn-secondary btn-sm chat-toggle" aria-pressed={chatOpen}
+            aria-controls="ai-dock" onClick={() => setChatOpen((o) => !o)}>
+      <Icon name="bot" size={16} /> {chatOpen ? "Hide assistant" : "AI assistant"}
+    </button>
+  );
+  const footer = (key) => (
+    <StepFooter stepKey={key} done={done} task={task} onGo={setTab}
+                last={<button type="button" className="btn btn-primary btn-lg" onClick={onDashboard}>
+                  <Icon name="dashboard" size={17} /> Back to dashboard</button>} />
+  );
+
   return (
     <>
-      <div className="brand" style={{ marginBottom: 8, justifyContent: "space-between", width: "100%" }}>
-        <h1 style={{ fontSize: 18 }}>{filename}</h1>
-        <span style={{ display: "flex", gap: 8 }}>
-          <button className="ghost" style={{ padding: "4px 12px" }} onClick={download}>
-            Download report.json
-          </button>
-          <button className="ghost" style={{ padding: "4px 12px" }} onClick={onReset}>
-            ← New file
-          </button>
-        </span>
-      </div>
+      {isStep ? (
+        <StepHeader stepKey={tab} done={done} task={task}>
+          {tab === "insights" && (
+            <button type="button" className="btn btn-quiet btn-sm" onClick={download} title="The full audit as JSON">
+              <Icon name="download" size={15} /> Audit JSON
+            </button>
+          )}
+          {chatToggle}
+        </StepHeader>
+      ) : (
+        <header className="step-head">
+          <div className="step-head-row">
+            <div className="step-head-text">
+              <h1 className="step-title"><span className="step-title-icon"><Icon name="sigma" size={20} /></span>Statistics</h1>
+              <p className="step-blurb">Descriptive and inferential tests on {data.title || filename}, each with its assumptions and effect size.</p>
+            </div>
+            <div className="step-head-actions">{chatToggle}</div>
+          </div>
+        </header>
+      )}
 
-      <div className="report-row">
+      <div className={`report-row ${chatOpen ? "" : "chat-closed"}`}>
         <div className="report-main">
 
-      {/* Tabs — flow order: audit -> clean -> explore -> preprocess */}
-      <div className="tabs">
-        <button className={tab === "insights" ? "tab on" : "tab"} onClick={() => setTab("insights")}>
-          Insights
-        </button>
-        <button className={tab === "cleaning" ? "tab on" : "tab"} onClick={() => setTab("cleaning")}>
-          Cleaning
-        </button>
-        <button className={tab === "eda" ? "tab on" : "tab"} onClick={() => setTab("eda")}>
-          EDA
-        </button>
-        <button
-          className={tab === "preprocessing" ? "tab on" : "tab"}
-          onClick={() => setTab("preprocessing")}
-        >
-          Preprocessing
-        </button>
-        <button className={tab === "training" ? "tab on" : "tab"} onClick={() => setTab("training")}>
-          Train
-        </button>
-      </div>
-
       {/* Compact active target indicator for downstream tabs */}
-      {tab !== "insights" && target && (
-        <div
-          className="target-compact-bar"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            background: "var(--cream-card-subtle, #F5EFE6)",
-            border: "1px solid var(--cream-border, #E8DFD1)",
-            borderRadius: "10px",
-            padding: "8px 14px",
-            marginBottom: "14px",
-            fontSize: "13px",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-            <span style={{ fontSize: "14px" }}>🎯</span>
-            <span>
-              Target column: <strong style={{ color: "var(--cream-accent, #C26E38)" }}>{target}</strong>
-              <span className="tag" style={{ marginLeft: "8px", textTransform: "capitalize", fontSize: "11px", padding: "1px 6px" }}>
-                {task || (info[target]?.type === "numeric" ? "regression" : "classification")}
-              </span>
-            </span>
-          </div>
-          <button
-            type="button"
-            className="pp-link"
-            style={{ fontSize: "12.5px", cursor: "pointer", background: "none", border: "none" }}
-            onClick={() => {
-              setTab("insights");
-              window.scrollTo({ top: 0, behavior: "smooth" });
-            }}
-          >
-            Change target in Audit
-          </button>
+      {tab !== "insights" && (target || task === "clustering") && (
+        <div className="target-bar">
+          <Icon name="target" size={16} />
+          <span>
+            {task === "clustering" ? "No target (clustering)" : <>Target <b>{target}</b></>}
+            <span className="pill pill-neutral">{task || (info[target]?.type === "numeric" ? "regression" : "classification")}</span>
+          </span>
+          <button type="button" className="link-btn" onClick={() => setTab("insights")}>Change</button>
         </div>
       )}
 
       {/* ===== INSIGHTS TAB ===== */}
       <div hidden={tab !== "insights"}>
         {/* Target: selected during Quality Audit to guide cleaning, EDA, and preprocessing */}
-        <TargetPicker data={data} target={target} setTarget={setTarget} />
+        <TargetPicker data={data} target={target} setTarget={setTarget} taskChoice={taskChoice} setTaskChoice={setTaskChoice} />
+        {data.load_notes?.length > 0 && (
+          <div className="panel" style={{ padding: 12, marginBottom: 10 }}>
+            <b>Reading the file</b>
+            <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>{data.load_notes.map((n, i) => <li key={i} className="note">{n}</li>)}</ul>
+          </div>
+        )}
 
       {/* Summary */}
       <section>
@@ -616,10 +604,11 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
       {numericCols.length > 0 && (
         <Section title="Numeric statistics">
           <Table
-            head={["Column", "Min", "Max", "Mean", "Median", "Std", "Q1", "Q3"]}
+            head={["Column", "Min", "Max", "Mean", "Median", "Std", "Q1", "Q3", "Skewness", "Kurtosis"]}
             rows={numericCols.map((n) => {
               const s = info[n].statistics;
-              return [n, num(s.min), num(s.max), num(s.mean), num(s.median), num(s.std), num(s.q1), num(s.q3)];
+              return [n, num(s.min), num(s.max), num(s.mean), num(s.median), num(s.std), num(s.q1), num(s.q3),
+                      num(s.skew), num(s.kurtosis)];
             })}
           />
         </Section>
@@ -763,8 +752,8 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
             ))}
         </div>
         <p className="note">
-          Recommendations are read-only for now — applying them (impute, encode, scale, balance) is
-          the next backend milestone.
+          Apply them on the Cleaning tab (whole-table fixes) and the Preprocessing tab (impute, encode, scale,
+          outliers, imbalance — fitted on the training split only).
         </p>
       </Section>
 
@@ -776,23 +765,7 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
         </details>
       </Section>
 
-      {/* Action Bar Footer */}
-      <div className="preview-action-bar" style={{ marginTop: 28, paddingTop: 16 }}>
-        <button
-          id="btn-proceed-cleaning"
-          type="button"
-          className="btn-proceed-audit"
-          onClick={() => {
-            setTab("cleaning");
-            window.scrollTo({ top: 0, behavior: "smooth" });
-          }}
-        >
-          <span>Proceed to data cleaning</span>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </button>
-      </div>
+        {footer("insights")}
       </div>
 
       {/* ===== CLEANING TAB ===== */}
@@ -804,12 +777,11 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
           plan={plan?.clean}
           planLoading={planLoading}
           planErr={planErr}
-          onCleaned={onCleaned}
-          onProceedEDA={() => {
-            setTab("eda");
-            window.scrollTo({ top: 0, behavior: "smooth" });
-          }}
+          onCleaned={(fresh, how) => { onDataChanged(fresh); mark("clean", !how?.reset); }}
+          onKept={() => mark("clean")}
+          onProceedEDA={() => setTab("eda")}
         />
+        {footer("cleaning")}
       </div>
 
       {/* ===== EDA TAB ===== */}
@@ -817,65 +789,48 @@ function Report({ data, setData, onReset, tab: activeTabProp, setTab: setActiveT
         <Charts data={data} />
         <EdaGallery data={data} />
         <ChartBuilder data={data} />
-
-        {/* Action Bar at the end of Visual EDA */}
-        <div
-          className="eda-action-bar preview-action-bar"
-          style={{
-            marginTop: 32,
-            paddingTop: 20,
-            borderTop: "1px solid var(--cream-border)",
-            display: "flex",
-            justifyContent: "flex-end",
-            alignItems: "center",
-          }}
-        >
-          <button
-            id="btn-proceed-processing"
-            type="button"
-            className="btn-proceed-audit"
-            onClick={() => {
-              setTab("preprocessing");
-              window.scrollTo({ top: 0, behavior: "smooth" });
-            }}
-          >
-            <span>Proceed Processing</span>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path d="M5 12h14M12 5l7 7-7 7" />
-            </svg>
-          </button>
-        </div>
+        {footer("eda")}
       </div>
 
       {/* ===== PREPROCESSING TAB ===== */}
       <div hidden={tab !== "preprocessing"}>
         <Preprocess
-          key={target + ":" + rev}
+          key={target + ":" + task + ":" + rev}
           data={data}
-          target={target}
+          target={task === "clustering" ? "" : target}
           task={task}
           plan={plan?.preprocess}
           aiPipeline={plan?.pipeline}
           planLoading={planLoading}
           planErr={planErr}
           onPlan={setLivePlan}
-          onDone={() => setPrepRev((r) => r + 1)}
-          onProceedTraining={() => {
-            setTab("training");
-            window.scrollTo({ top: 0, behavior: "smooth" });
-          }}
+          onDone={() => { setPrepRev((r) => r + 1); mark("preprocess"); mark("prepFor", task === "clustering" ? "" : target); mark("train", false); }}
         />
+        {footer("preprocessing")}
       </div>
 
       {/* ===== TRAINING TAB ===== */}
       <div hidden={tab !== "training"}>
-        <Train key={`train:${rev}:${prepRev}`} data={data} target={target} active={tab === "training"}
-               onResults={setTrainResults} onAsk={(text) => setChatAsk((a) => ({ text, n: (a?.n || 0) + 1 }))} />
+        <Train key={`train:${rev}:${prepRev}`} data={data} target={task === "clustering" ? "" : target} active={tab === "training"}
+               onResults={setTrainResults} onAsk={(text) => setChatAsk((a) => ({ text, n: (a?.n || 0) + 1 }))}
+               onTrained={() => mark("train")} />
+        {footer("training")}
+      </div>
+
+      {/* ===== STATISTICS TAB ===== */}
+      <div hidden={tab !== "statistics"}>
+        {tab === "statistics" && <Statistics key={"stats:" + rev} data={data} onCleaned={onDataChanged} />}
+      </div>
+
+      {/* ===== REPORT TAB ===== */}
+      <div hidden={tab !== "report"}>
+        {tab === "report" && <ReportPanel data={data} refreshKey={prepRev + rev} onDownloaded={() => mark("report")} />}
+        {footer("report")}
       </div>
 
         </div>{/* /report-main */}
 
-        <aside className="chat-dock">
+        <aside className="chat-dock" id="ai-dock" hidden={!chatOpen} aria-label="AI assistant">
           <ChatPanel data={data} target={target} task={task} plan={livePlan} results={trainResults} asked={chatAsk} />
         </aside>
       </div>{/* /report-row */}

@@ -1,36 +1,11 @@
 "use client";
 
 import { useRef, useState } from "react";
+import Icon from "./icons";
 
-const SAMPLES = [
-  {
-    id: "churn",
-    title: "Customer Churn",
-    type: "Classification",
-    filename: "customer_churn.csv",
-    icon: "🏦",
-    task: "classification",
-    desc: "Predict customer churn with tenure & monthly charges",
-  },
-  {
-    id: "housing",
-    title: "California Housing",
-    type: "Regression",
-    filename: "california_housing.csv",
-    icon: "🏠",
-    task: "regression",
-    desc: "Predict median house values across districts",
-  },
-  {
-    id: "diabetes",
-    title: "Healthcare Risk",
-    type: "Classification",
-    filename: "healthcare_diabetes.csv",
-    icon: "🩺",
-    task: "classification",
-    desc: "Diagnostic metrics for diabetes outcome prediction",
-  },
-];
+// Sample datasets come from the backend (/api/upload/limits -> samples): they are the
+// datasets bundled with scikit-learn, so they exist on every install -- no files to ship.
+const SAMPLE_ICON = { classification: "stethoscope", regression: "trendingUp", clustering: "scatter" };
 
 export default function DatasetUpload({
   file,
@@ -43,7 +18,8 @@ export default function DatasetUpload({
   error,
   onAnalyze,
   onReset,
-  limits, // {max_mb, allowed} from the backend (/api/upload/limits); null until loaded
+  limits, // {max_mb, allowed, samples} from the backend (/api/upload/limits); null until loaded
+  onSample, // (key, task) -> loads a bundled sample dataset through the backend
 }) {
   const [dragOver, setDragOver] = useState(false);
   const [sampleLoading, setSampleLoading] = useState(false);
@@ -62,15 +38,7 @@ export default function DatasetUpload({
   async function loadSampleDataset(sample) {
     try {
       setSampleLoading(true);
-      const res = await fetch(`/samples/${sample.filename}`);
-      if (!res.ok) throw new Error("Could not load sample file");
-      const blob = await res.blob();
-      const sampleFile = new File([blob], sample.filename, { type: "text/csv" });
-      setFile(sampleFile);
-      setDatasetName(sample.title);
-      setTaskType(sample.task);
-    } catch (e) {
-      console.error("Error loading sample:", e);
+      await onSample(sample.key, sample.task);
     } finally {
       setSampleLoading(false);
     }
@@ -88,9 +56,9 @@ export default function DatasetUpload({
       {/* View Header */}
       <div className="upload-view-header">
         <div className="upload-header-text">
-          <h1 className="upload-title">Upload Your Dataset</h1>
+          <h1 className="upload-title">Upload a dataset</h1>
           <p className="upload-subtitle">
-            Upload CSV or Excel files to profile schema, audit data hygiene, and forge leak-free ML pipelines.
+            Upload CSV, TSV, JSON or Excel files to profile schema, audit data hygiene, and forge leak-free ML pipelines.
           </p>
         </div>
       </div>
@@ -238,7 +206,7 @@ export default function DatasetUpload({
               <option value="auto">Auto Detect (Recommended)</option>
               <option value="classification">Classification (Binary / Multi-Class)</option>
               <option value="regression">Regression (Continuous Numeric)</option>
-              <option value="unsupervised">Clustering / Unsupervised EDA</option>
+              <option value="clustering">Clustering (no target)</option>
             </select>
           </div>
         </div>
@@ -246,7 +214,7 @@ export default function DatasetUpload({
         {/* Fit-on-Train Guard & Feature Notice */}
         <div className="config-badge-strip">
           <div className="guard-badge">
-            <span className="guard-icon">🛡️</span>
+            <span className="guard-icon"><Icon name="shield" size={17} /></span>
             <div>
               <strong>Strict Fit-on-Train Guard Active:</strong>
               <span> Scalers and encoders are strictly fitted on the training split to eliminate data leakage.</span>
@@ -262,18 +230,19 @@ export default function DatasetUpload({
           {sampleLoading && <span className="sample-loading-text">Loading sample…</span>}
         </div>
         <div className="sample-chips-row">
-          {SAMPLES.map((sample) => (
+          {(limits?.samples || []).map((sample) => (
             <button
-              key={sample.id}
+              key={sample.key}
               type="button"
-              className={`sample-chip ${file?.name === sample.filename ? "active" : ""}`}
+              className="sample-chip"
               onClick={() => loadSampleDataset(sample)}
               disabled={loading || sampleLoading}
+              title={`Target: ${sample.target}`}
             >
-              <span className="sample-icon">{sample.icon}</span>
+              <span className="sample-icon"><Icon name={SAMPLE_ICON[sample.task] || "chart"} size={18} /></span>
               <div className="sample-chip-text">
                 <span className="sample-chip-title">{sample.title}</span>
-                <span className="sample-chip-tag">{sample.type}</span>
+                <span className="sample-chip-tag">{sample.task}</span>
               </div>
             </button>
           ))}
@@ -283,7 +252,7 @@ export default function DatasetUpload({
       {/* Error Alert Display */}
       {error && (
         <div className="upload-error-alert">
-          <div className="error-icon">⚠️</div>
+          <div className="error-icon"><Icon name="alert" size={18} /></div>
           <div className="error-text">
             <strong>Analysis Failed:</strong> {error}
           </div>

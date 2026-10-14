@@ -20,5 +20,12 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+    @property
+    def role(self):
+        """Administrators are listed in ADMIN_EMAILS (backend/.env) -- no table column,
+        so existing databases need no migration."""
+        from core.config import ADMIN_EMAILS
+        return "admin" if (self.email or "").lower() in ADMIN_EMAILS else "user"
+
     def __repr__(self):
         return f"<User id={self.id} email='{self.email}' provider='{self.auth_provider}'>"

@@ -46,6 +46,15 @@ assert res["best"] == "logistic_regression" and res["models"]["logistic_regressi
 model = joblib.load(T.run_model(ds, run, "").path)
 assert len(model.predict(df.drop(columns="y").head(5))) == 5   # raw feature rows in, predictions out
 
+# result charts come straight from the saved predictions (binary "bad"/"good")
+ch = T.run_curves(ds, run, "logistic_regression")
+lr_test = res["models"]["logistic_regression"]["test"]
+assert len(ch["confusion"]) == 2 and ch["classes"] == res["classes"]
+diag = ch["confusion"][0][0] + ch["confusion"][1][1]
+assert diag == round(lr_test["accuracy"] * sum(sum(r) for r in ch["confusion"]))  # matrix agrees with reported accuracy
+assert abs(ch["roc"][0]["auc"] - lr_test["roc_auc"]) < 1e-6                        # ROC agrees with reported AUC
+
+
 # boosters run end to end on whatever device the registry picked (GPU when one is usable)
 device = {m["key"]: m["device"] for m in opt["models"]}
 boost = T.start_training({"id": ds, "models": ["xgboost", "catboost"], "folds": 3,

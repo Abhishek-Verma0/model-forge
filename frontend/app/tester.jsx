@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { API, call, fmt } from "./apiclient";
+import { call, download, fmt } from "./apiclient";
 
 // Test a trained model (from a run, or saved) on an uploaded file or on the run's
 // locked test set; save run models under a name; manage saved models.
@@ -26,7 +26,7 @@ export default function ModelTester({ dsId, metrics, refreshKey }) {
   async function load() {
     try {
       const [r, s] = await Promise.all([call(`/api/runs/summary?id=${dsId}`), call(`/api/models?id=${dsId}`)]);
-      setRuns(r.filter((x) => x.kind === "train" && x.state === "done"));
+      setRuns(r.filter((x) => ["train", "tune"].includes(x.kind) && x.state === "done"));
       setSaved(s);
     } catch (e) { setErr(e.message); }
   }
@@ -65,13 +65,7 @@ export default function ModelTester({ dsId, metrics, refreshKey }) {
 
   async function downloadCsv() {
     setErr("");
-    try {
-      const res = await fetch(`${API}/api/predict`, { method: "POST", body: form("csv") });
-      if (!res.ok) throw new Error((await res.json()).detail || `Error ${res.status}`);
-      const url = URL.createObjectURL(await res.blob());
-      Object.assign(document.createElement("a"), { href: url, download: "predictions.csv" }).click();
-      URL.revokeObjectURL(url);
-    } catch (e) { setErr(e.message); }
+    try { await download("/api/predict", "predictions.csv", form("csv")); } catch (e) { setErr(e.message); }
   }
 
   async function loadTestSet(off = 0, onlyMistakes = mistakes) {
@@ -188,7 +182,7 @@ export default function ModelTester({ dsId, metrics, refreshKey }) {
           <div style={{ marginTop: 12 }}>
             <p style={{ margin: "0 0 4px", fontWeight: 600 }}>Predict on a file</p>
             <p className="note" style={{ margin: "0 0 6px" }}>CSV or Excel with the same columns as the original upload. Include the target column to also get metrics.</p>
-            <input type="file" accept=".csv,.xlsx,.xls" onChange={(e) => { setFile(e.target.files?.[0] || null); setPred(null); }} />{" "}
+            <input type="file" accept=".csv,.tsv,.json,.xlsx,.xls" onChange={(e) => { setFile(e.target.files?.[0] || null); setPred(null); }} />{" "}
             <button className="primary" disabled={!file || busy} onClick={predict}>{busy ? "Predicting…" : "Predict"}</button>{" "}
             {pred && <button className="ghost" onClick={downloadCsv}>Download all predictions (CSV)</button>}
           </div>
@@ -238,7 +232,7 @@ export default function ModelTester({ dsId, metrics, refreshKey }) {
                   <td>{m.name}</td><td>{m.label}</td><td>{new Date(m.created * 1000).toLocaleString()}</td>
                   <td>{label(m.primary_metric)} {fmt(m.test?.[m.primary_metric])}</td><td>{m.size_mb} MB</td>
                   <td>
-                    <a className="ghost" href={`${API}/api/models/download?id=${dsId}&model=${m.model_id}`}>Download</a>{" "}
+                    <button className="ghost" onClick={() => download(`/api/models/download?id=${dsId}&model=${m.model_id}`, `${m.name}.joblib`).catch((e) => setErr(e.message))}>Download</button>{" "}
                     <button className="ghost" onClick={() => remove(m.model_id)}>Delete</button>
                   </td>
                 </tr>

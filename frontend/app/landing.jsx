@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useAuth } from "./authcontext";
+import Icon from "./icons";
 
 export default function Landing({ onLaunchStudio }) {
   const { user, openAuthModal, logout } = useAuth();
@@ -136,15 +137,15 @@ export default function Landing({ onLaunchStudio }) {
             {/* Quick Proof Badges */}
             <div className="hero-proof-bar">
               <div className="proof-item">
-                <span className="proof-check">✓</span>
+                <span className="proof-check"><Icon name="check" size={13} strokeWidth={3} /></span>
                 <span>200 MB Ingestion</span>
               </div>
               <div className="proof-item">
-                <span className="proof-check">✓</span>
+                <span className="proof-check"><Icon name="check" size={13} strokeWidth={3} /></span>
                 <span>Zero Data Leakage</span>
               </div>
               <div className="proof-item">
-                <span className="proof-check">✓</span>
+                <span className="proof-check"><Icon name="check" size={13} strokeWidth={3} /></span>
                 <span>Ollama AI Copilot</span>
               </div>
             </div>
@@ -230,7 +231,7 @@ export default function Landing({ onLaunchStudio }) {
               <div className="bento-card bento-recipe">
                 <div className="card-top-row">
                   <div className="recipe-title-group">
-                    <span className="recipe-icon">⚡</span>
+                    <span className="recipe-icon"><Icon name="zap" size={13} /></span>
                     <span className="card-mini-title">ML Pipeline Execution</span>
                   </div>
                   <span className="leak-badge">Fit on Train Only</span>
@@ -418,7 +419,7 @@ export default function Landing({ onLaunchStudio }) {
           </div>
 
           <div className="feature-bento-card">
-            <div className="feature-icon-circle">🤖</div>
+            <div className="feature-icon-circle"><Icon name="bot" size={20} /></div>
             <h3>Ollama Local AI Copilot</h3>
             <p>
               Run inference locally without sending confidential dataset rows to cloud providers. Ask questions about your features and receive actionable recommendations.
@@ -426,7 +427,7 @@ export default function Landing({ onLaunchStudio }) {
           </div>
 
           <div className="feature-bento-card">
-            <div className="feature-icon-circle">📊</div>
+            <div className="feature-icon-circle"><Icon name="chart" size={20} /></div>
             <h3>Custom EDA & Chart Studio</h3>
             <p>
               Plot box plots, bivariate scatters, histograms, and correlation heatmaps generated on the fly via Matplotlib, Seaborn, and SVG charts.

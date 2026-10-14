@@ -94,6 +94,25 @@ class UserLoginRequest(BaseModel):
         return v
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., max_length=2048)
+    password: str = Field(..., max_length=128)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        return UserRegisterRequest.validate_password_strength(v)   # one password rule everywhere
+
+
 class GoogleAuthRequest(BaseModel):
     credential: str = Field(..., description="Google ID Token issued by Google Identity Services")
 
@@ -104,6 +123,8 @@ class UserResponse(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     auth_provider: str
+    role: str = "user"
+    is_active: bool = True
     created_at: Optional[datetime] = None
 
     class Config:

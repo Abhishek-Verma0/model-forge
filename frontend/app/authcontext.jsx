@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState } from "react";
-import { API } from "./apiclient";
+import { API, TOKEN_KEY } from "./apiclient";
 
 const AuthContext = createContext(null);
 
@@ -10,10 +10,12 @@ export function AuthProvider({ children }) {
   const [token, setToken] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [authModalOpen, setAuthModalOpen] = useState(false);
-  const [authModalMode, setAuthModalMode] = useState("login"); // "login" | "register"
-  const [googleClientId, setGoogleClientId] = useState(
-    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || ""
-  );
+  const [authModalMode, setAuthModalMode] = useState("login"); // "login" | "register" | "forgot" | "reset"
+  // The server decides: it only accepts Google tokens issued to ITS client id, so the
+  // button shows only when the backend has one (GOOGLE_CLIENT_ID in backend/.env).
+  const [googleClientId, setGoogleClientId] = useState("");
+  const [passwordReset, setPasswordReset] = useState(false);
+  const [resetToken, setResetToken] = useState("");
 
   // Load user session and backend auth config on mount
   useEffect(() => {
@@ -23,16 +25,24 @@ export function AuthProvider({ children }) {
         const confRes = await fetch(`${API}/api/auth/config`);
         if (confRes.ok) {
           const conf = await confRes.json();
-          if (conf.google_client_id) {
-            setGoogleClientId(conf.google_client_id);
-          }
+          setGoogleClientId(conf.google_client_id || "");
+          setPasswordReset(!!conf.password_reset);
         }
       } catch (err) {
         console.warn("Could not load auth config from backend:", err);
       }
 
+      // A password-reset link (?reset=<token>) opens the reset form; the token leaves the address bar.
+      const link = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("reset") : null;
+      if (link) {
+        setResetToken(link);
+        setAuthModalMode("reset");
+        setAuthModalOpen(true);
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+
       // 2. Validate existing token in localStorage
-      const savedToken = typeof window !== "undefined" ? localStorage.getItem("modelforge_token") : null;
+      const savedToken = typeof window !== "undefined" ? localStorage.getItem(TOKEN_KEY) : null;
       if (savedToken) {
         try {
           const res = await fetch(`${API}/api/auth/me`, {
@@ -44,7 +54,7 @@ export function AuthProvider({ children }) {
             setToken(savedToken);
           } else {
             // Token expired or invalid
-            localStorage.removeItem("modelforge_token");
+            localStorage.removeItem(TOKEN_KEY);
             setUser(null);
             setToken(null);
           }
@@ -57,6 +67,10 @@ export function AuthProvider({ children }) {
     }
 
     initAuth();
+    // any request answered 401 (session expired or revoked) signs out everywhere
+    const out = () => { localStorage.removeItem(TOKEN_KEY); setToken(null); setUser(null); };
+    window.addEventListener("modelforge:signed-out", out);
+    return () => window.removeEventListener("modelforge:signed-out", out);
   }, []);
 
   function openAuthModal(mode = "login") {
@@ -70,7 +84,7 @@ export function AuthProvider({ children }) {
 
   function handleAuthSuccess(authData) {
     if (authData.access_token && authData.user) {
-      localStorage.setItem("modelforge_token", authData.access_token);
+      localStorage.setItem(TOKEN_KEY, authData.access_token);
       setToken(authData.access_token);
       setUser(authData.user);
       setAuthModalOpen(false);
@@ -137,9 +151,33 @@ export function AuthProvider({ children }) {
     return data.user;
   }
 
+  async function forgotPassword(email) {
+    const res = await fetch(`${API}/api/auth/forgot`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email.trim().toLowerCase() }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(formatAuthError(data.detail, "Could not send the reset email."));
+    return data.detail;
+  }
+
+  async function resetPassword(password) {
+    const res = await fetch(`${API}/api/auth/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: resetToken, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(formatAuthError(data.detail, "Could not reset the password."));
+    setResetToken("");
+    handleAuthSuccess(data);
+    return data.user;
+  }
+
   function logout() {
     if (typeof window !== "undefined") {
-      localStorage.removeItem("modelforge_token");
+      localStorage.removeItem(TOKEN_KEY);
     }
     setToken(null);
     setUser(null);
@@ -162,6 +200,9 @@ export function AuthProvider({ children }) {
         loginWithGoogle,
         logout,
         googleClientId,
+        passwordReset,
+        forgotPassword,
+        resetPassword,
       }}
     >
       {children}

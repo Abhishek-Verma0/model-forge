@@ -14,7 +14,7 @@ pipeline = {
   "outlier_removal": {"method": "isolation_forest", "contamination": 0.05},  # drops TRAIN rows only
   "feature_selection":{"method": "correlation"|"chi2"|"anova"|"mutual_info"|"rfe", "k": 10},
   "imbalance":       {"method": "oversample"|"undersample"|"smote"|"class_weights"},
-  "reduction":       {"method": "pca", "n": 5},
+  "reduction":       {"method": "pca"|"autoencoder", "n": 5},
 }
 Any sub-key omitted / {"method":"none"} = that step is skipped.
 
@@ -25,6 +25,7 @@ scatter/pairplot already cover 2-D visualization.
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
 
 CONTAMINATION = 0.05      # our starting point: IsolationForest expected outlier share (scikit-learn's is "auto")
 KNN_NEIGHBORS = 5         # published default: scikit-learn KNNImputer n_neighbors=5
@@ -35,7 +36,7 @@ _IMPUTE = ("knn", "iterative")
 _OUTREM = ("isolation_forest",)
 _FS = ("correlation", "chi2", "anova", "mutual_info", "rfe")
 _IMB = ("oversample", "undersample", "smote", "class_weights")
-_RED = ("pca",)
+_RED = ("pca", "autoencoder")
 
 
 def _m(section, p):
@@ -194,29 +195,46 @@ def balance(X_tr, y_tr, method, task):
 
 # --- dimensionality reduction (fit on train) --------------------------------
 
-def fit_reduce(X_tr, n):
-    from sklearn.decomposition import PCA
+def fit_reduce(X_tr, n, method="pca"):
+    """Numeric columns -> n components, fitted on train. pca: principal components.
+    autoencoder (plan §9.6 "autoencoder + classifier"): a one-hidden-layer network
+    (scikit-learn MLPRegressor, its default ReLU) trained to rebuild its input from
+    n units; the n unit activations become the features. Scale the numeric columns
+    first -- a network learns poorly from unscaled numbers."""
     num = X_tr.select_dtypes("number")
     if num.shape[1] < 2:
         return None, "too few numeric features for reduction"
     n = max(1, min(int(n or 2), num.shape[1]))
-    state = {"pca": PCA(n_components=n, random_state=0).fit(num), "num": list(num.columns)}
+    if method == "autoencoder":
+        import warnings
+        from sklearn.neural_network import MLPRegressor
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # ConvergenceWarning at the default 200 epochs is reported below
+            ae = MLPRegressor(hidden_layer_sizes=(n,), random_state=0).fit(num, num)
+        state = {"ae": ae, "num": list(num.columns), "n": n, "prefix": "ae"}
+        return state, (f"autoencoder -> {n} feature(s), rebuilds the training columns with "
+                       f"R² {ae.score(num, num):.2f}")
+    state = {"pca": PCA(n_components=n, random_state=0).fit(num), "num": list(num.columns), "n": n, "prefix": "pc"}
     var = round(float(state["pca"].explained_variance_ratio_.sum()) * 100, 1)
     return state, f"PCA -> {n} component(s), {var}% variance retained"
 
 
 def reduce(X_tr, X_te, method, n):
-    state, note = fit_reduce(X_tr, n)
+    state, note = fit_reduce(X_tr, n, method or "pca")
     if state is None:
         return X_tr, X_te, note, None
     return reduce_apply(state, X_tr), reduce_apply(state, X_te), note, state
 
 
 def reduce_apply(state, X):
-    """Numeric columns -> PCA components; anything else (raw text) passes through."""
-    n = state["pca"].n_components_
-    pcs = pd.DataFrame(state["pca"].transform(X[state["num"]]),
-                       columns=[f"pc{i + 1}" for i in range(n)], index=X.index)
+    """Numeric columns -> components; anything else (raw text) passes through."""
+    num = X[state["num"]].to_numpy(dtype="float64")
+    if "ae" in state:   # encoder half: ReLU(X W + b) of the hidden layer
+        Z = np.maximum(num @ state["ae"].coefs_[0] + state["ae"].intercepts_[0], 0)
+    else:
+        Z = state["pca"].transform(X[state["num"]])
+    prefix = state.get("prefix", "pc")      # pipelines saved before autoencoders have no prefix
+    pcs = pd.DataFrame(Z, columns=[f"{prefix}{i + 1}" for i in range(Z.shape[1])], index=X.index)
     return pd.concat([pcs, X.drop(columns=state["num"])], axis=1)
 
 
@@ -255,6 +273,13 @@ if __name__ == "__main__":
     # PCA reduces to n components on train + test
     r_tr, r_te, note, _ = reduce(Xtr, Xte, "pca", 2)
     assert list(r_tr.columns) == ["pc1", "pc2"] and len(r_te) == len(Xte), note
+    # autoencoder: n learned features; the encoder is the network's own first layer
+    from sklearn.preprocessing import StandardScaler
+    Xs = pd.DataFrame(StandardScaler().fit_transform(Xtr), columns=Xtr.columns)
+    a_tr, a_te, note, st = reduce(Xs, Xs.iloc[:10], "autoencoder", 2)
+    assert list(a_tr.columns) == ["ae1", "ae2"] and len(a_te) == 10 and "autoencoder" in note, note
+    hidden = st["ae"].coefs_[0].shape[1]
+    assert hidden == 2 and (a_tr.to_numpy() >= 0).all()      # ReLU activations of the 2 hidden units
 
     validate_pipeline({"feature_selection": {"method": "chi2", "k": 3}})
     try:

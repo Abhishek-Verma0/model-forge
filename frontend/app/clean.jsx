@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 
-import { API } from "./apiclient";
+import { call } from "./apiclient";
+import Icon from "./icons";
 const RETYPE_OPTS = ["keep", "number", "datetime", "category"];
 
 // One AI clean op -> plain words, so the user can SEE the suggestion.
@@ -11,7 +12,7 @@ function readableClean(o) {
   if (o.op === "merge_categories") return "merge inconsistent categories";
   if (o.op === "retype") return `convert to ${o.to || "number"}`;
   if (o.op === "rename_column") return `rename to “${o.to}”`;
-  if (o.op === "nullify") return "treat placeholders as missing";
+  if (o.op === "nullify") return o.values ? `treat ${o.values.join(", ")} as missing` : "treat placeholders as missing";
   if (o.op === "map_values") return "relabel values";
   if (o.op === "drop_column") return "drop this column";
   if (o.op === "drop_missing_rows") return "remove rows with missing values";
@@ -26,6 +27,7 @@ function plannedClean(s, dropped) {
   if (s.trim) parts.push("trim whitespace");
   if (s.merge) parts.push("merge inconsistent categories");
   if (s.retype && s.retype !== "keep") parts.push(`convert to ${s.retype}`);
+  if (s.zeros) parts.push("zeros -> missing");
   return parts.length ? parts.join(", ") : "no change";
 }
 
@@ -43,6 +45,8 @@ function gatherFlags(report) {
     for (const k of Object.keys(c.issues)) {
       if (k === "whitespace_values") add(c.column, "whitespace", { trim: true });
       if (k === "numeric_stored_as_text") add(c.column, "numbers stored as text", { retype: "number" });
+      // zeros can stand for "not measured" (e.g. glucose 0 in the Pima data) -- only the user knows; never pre-ticked
+      if (k === "zero_values") add(c.column, `${c.issues[k].toLocaleString()} zero(s)`, {});
     }
   }
   for (const c of checks.constant_columns.columns) add(c.column, "constant", { drop: true });
@@ -51,7 +55,7 @@ function gatherFlags(report) {
   return flags;
 }
 
-export default function Clean({ data, target, plan, planLoading, planErr, onCleaned, onApplyAI, onProceedEDA }) {
+export default function Clean({ data, target, plan, planLoading, planErr, onCleaned, onKept, onApplyAI, onProceedEDA }) {
   const { profile, report, sample } = data;
   const info = profile.columns_info;
   const flags = gatherFlags(report);
@@ -66,6 +70,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
   const totalRows = report.checks.missing_values.summary.total_rows;
   const missingRows = report.checks.missing_values.summary.rows_with_missing ?? 0;
   const allCols = profile.column_names;
+  const zeroCols = new Set(report.checks.value_issues.columns.filter((c) => c.issues.zero_values).map((c) => c.column));
 
   const semType = {};
   for (const c of report.checks.column_types.columns) semType[c.column] = c.detected_type;
@@ -102,7 +107,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
   const seedDrops = new Set([
     ...Object.keys(flags).filter((c) => flags[c].suggest?.drop),
     ...aiDrops,
-  ]);
+  ].filter((c) => c !== target));   // the target is never suggested for dropping (a unique float target looked "ID-like")
 
   // per-column fix ops (drop lives separately in dropCols, one source of truth)
   const init = {};
@@ -123,6 +128,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
   const [summary, setSummary] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [cleanDone, setCleanDone] = useState(false);
+  const [kept, setKept] = useState(false); // confirmed: no cleaning needed
 
   function set(col, field, value) {
     setCols((c) => ({ ...c, [col]: { ...c[col], [field]: value } }));
@@ -160,12 +166,11 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
     onApplyAI?.();
   }
 
+  // Order matters: columns are dropped and values fixed BEFORE duplicates are judged, so
+  // rows that differ only in a dropped ID column or in spelling / spacing count as the same
+  // row (deduping first left them in -- the same record could land in train and test).
   function buildOps() {
     const ops = [];
-    if (dedupe) ops.push({ op: "drop_duplicates" });
-    // nullify runs first so the placeholders it clears count as missing downstream.
-    if (nullify) for (const col of allCols) if (!dropCols.has(col)) ops.push({ op: "nullify", column: col });
-    if (dropNullRows) ops.push({ op: "drop_missing_rows" });   // after nullify: placeholders count as missing
     for (const col of dropCols) ops.push({ op: "drop_column", column: col });
     for (const col of shown) {
       if (dropCols.has(col)) continue; // dropped -> its fix ops are moot
@@ -179,7 +184,12 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
         if (Object.keys(mapping).length) ops.push({ op: "map_values", column: col, mapping });
       }
       if (s.retype && s.retype !== "keep") ops.push({ op: "retype", column: col, to: s.retype });
+      if (s.zeros) ops.push({ op: "nullify", column: col, values: [0] });
     }
+    // nullify before the row drop: placeholders it clears count as missing there
+    if (nullify) for (const col of allCols) if (!dropCols.has(col)) ops.push({ op: "nullify", column: col });
+    if (dropNullRows) ops.push({ op: "drop_missing_rows" });
+    if (dedupe) ops.push({ op: "drop_duplicates" });
     // renames LAST -- they change column names, and every op above uses originals.
     for (const col of allCols) {
       if (dropCols.has(col)) continue;
@@ -193,18 +203,10 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
     if (!confirm("Undo all cleaning and restore the uploaded data?")) return;
     setRunning(true); setError(""); setSummary(null);
     try {
-      const res = await fetch(`${API}/api/clean/reset`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: data.id, filename: data.filename }),
-      });
-      if (!res.ok) {
-        let d = `Error ${res.status}`;
-        try { const j = await res.json(); if (j.detail) d = j.detail; } catch {}
-        throw new Error(d);
-      }
-      onCleaned(await res.json());   // same path as a clean: re-profile and re-render everything
+      onCleaned(await call("/api/clean/reset", { id: data.id, filename: data.filename }), { reset: true });   // same path as a clean
+      setCleanDone(false); setKept(false);
     } catch (e) {
-      setError(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
+      setError(e.message);
     } finally { setRunning(false); }
   }
 
@@ -214,19 +216,11 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
     if (finalNames.some((n) => !n)) { setError("A column name can’t be blank."); return; }
     const dup = finalNames.find((n, i) => finalNames.indexOf(n) !== i);
     if (dup) { setError(`Duplicate column name “${dup}” — names must be unique.`); return; }
+    const ops = buildOps();
+    if (!ops.length) { setError(""); setKept(true); onKept?.(); return; }   // nothing to change: the table stays as it is
     setRunning(true); setError(""); setSummary(null);
     try {
-      const res = await fetch(`${API}/api/clean`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: data.id, ops: buildOps(), filename: data.filename }),
-      });
-      if (!res.ok) {
-        let d = `Error ${res.status}`;
-        try { const j = await res.json(); if (j.detail) d = j.detail; } catch {}
-        throw new Error(d);
-      }
-      const fresh = await res.json();
+      const fresh = await call("/api/clean", { id: data.id, ops, filename: data.filename });
       setSummary(fresh.clean_summary);
       setCleanDone(true);
       setShowModal(true);
@@ -239,11 +233,12 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
       setCols({});
       onCleaned?.(fresh); // downstream tabs (EDA, Preprocess) now use the cleaned data
     } catch (e) {
-      setError(e instanceof TypeError ? `Cannot reach the backend at ${API}.` : e.message);
+      setError(e.message);
     } finally { setRunning(false); }
   }
 
   const previewCols = allCols;
+  const pending = buildOps().length;   // what "Apply cleaning" would do right now
 
   return (
     <section>
@@ -420,6 +415,12 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
                       )}
                     </>
                   )}
+                  {numeric && !dropped && zeroCols.has(col) && (
+                    <label className="pp-check" title="Only you know whether 0 is a real value here. Missing values can then be filled on the Preprocessing tab.">
+                      <input type="checkbox" checked={!!s.zeros} onChange={(e) => set(col, "zeros", e.target.checked)} />
+                      Zeros mean “not measured” (treat 0 as missing)
+                    </label>
+                  )}
                   {!dropped && (
                     <label className="pp-field">
                       <span>Change type</span>
@@ -456,7 +457,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
       {/* Confirmation & Summary of applied clean changes */}
       {cleanDone && (
         <div className="clean-success-banner" role="status">
-          <div className="clean-success-icon">✓</div>
+          <div className="clean-success-icon"><Icon name="check" size={18} strokeWidth={3} /></div>
           <div className="clean-success-content">
             <div className="clean-success-title">Data cleaning done</div>
             <div className="clean-success-desc">
@@ -518,7 +519,7 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
               <span>Cleaning…</span>
             </>
           ) : (
-            <span>🧹 Run clean</span>
+            <><Icon name="eraser" size={17} /> <span>{pending ? `Apply cleaning (${pending} step${pending > 1 ? "s" : ""})` : "Keep the data as it is"}</span></>
           )}
         </button>
 
@@ -529,18 +530,8 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
           </button>
         )}
 
-        {onProceedEDA && (
-          <button
-            id="btn-proceed-eda"
-            type="button"
-            className="btn-proceed-audit"
-            onClick={onProceedEDA}
-          >
-            <span>Proceed to visual EDA</span>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path d="M5 12h14M12 5l7 7-7 7" />
-            </svg>
-          </button>
+        {kept && !running && (
+          <p className="clean-kept" role="status"><Icon name="check" size={15} strokeWidth={3} /> Kept the data as it is. Explore is next.</p>
         )}
       </div>
 
@@ -554,10 +545,10 @@ export default function Clean({ data, target, plan, planLoading, planErr, onClea
               onClick={() => setShowModal(false)}
               aria-label="Close modal"
             >
-              ✕
+              <Icon name="x" size={16} />
             </button>
 
-            <div className="modal-icon-badge">✓</div>
+            <div className="modal-icon-badge"><Icon name="check" size={22} strokeWidth={3} /></div>
             <h3 className="modal-title">Data cleaning done!</h3>
             <p className="modal-subtitle">
               Your dataset has been cleaned and re-profiled. Review the applied changes or proceed when you’re ready.

@@ -80,6 +80,7 @@ def provider_chain():
 
 
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+FRONTEND_URL_DEFAULT = CORS_ORIGINS[0] if CORS_ORIGINS else "http://localhost:3000"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", 200))
 # Datasets kept in memory at once (the disk copy is the source of truth). Our starting
 # point: 5; lower it on a machine with little RAM, raise it to switch datasets faster.
@@ -94,10 +95,31 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg2://postgres:postgres@localhost:5432/modelforge"
 )
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "modelforge_jwt_secret_dev_key_92837482910")
+# Unset (or shorter than 32 characters): a random key is generated once and kept in
+# DATA_DIR/.jwt_secret (core/security.py). Set it to share sessions between servers.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "").strip()
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))  # 7 days
+# Google sign-in is only accepted for tokens issued to THIS client id (the token's
+# audience) -- without it, a token Google issued to any other website would sign in.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+# Accounts with these emails get the administrator role (comma-separated).
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+# Password-reset emails. Without SMTP_HOST the "forgot password" request answers
+# 503 and says so; nothing else changes.
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))           # 587 = submission with STARTTLS (RFC 6409)
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
+SMTP_TLS = os.getenv("SMTP_TLS", "true").strip().lower() in ("1", "true", "yes", "on")
+# Where the reset link points (the web app). Defaults to the first CORS origin.
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip()
+
+# Uploaded data older than this many days (by last change) is deleted at startup.
+# 0 = keep until the owner deletes it (plan §24: deletion + a retention period).
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 0))
 
 
 def dataset_path():

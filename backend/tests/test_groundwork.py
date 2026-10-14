@@ -24,7 +24,10 @@ cleaned = D.do_clean({"id": ds, "ops": [{"op": "trim_whitespace", "column": "rev
 from core import config  # noqa: E402
 from preprocessing import execute  # noqa: E402
 assert cleaned["preprocess_options"] == execute.options()
-assert D.upload_limits() == {"max_mb": config.MAX_UPLOAD_MB, "allowed": [".csv", ".xls", ".xlsx"]}
+from api.common import ALLOWED  # noqa: E402
+limits = D.upload_limits()
+assert limits["max_mb"] == config.MAX_UPLOAD_MB and limits["allowed"] == sorted(ALLOWED)
+assert {".csv", ".tsv", ".json", ".xlsx"} <= set(limits["allowed"]) and limits["samples"]
 res = D.do_preprocess({"id": ds, "target": "y", "task": "classification",
                        "columns": {"review": [{"op": "encode", "method": "text"}]}})
 assert "fitted" not in res and "csv" not in res and res["train_rows"] == 32, res.keys()

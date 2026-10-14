@@ -1,50 +1,66 @@
-"""Data-phase routes: upload + audit, charts, cleaning, preprocessing, downloads.
-Routes only -- the work happens in preprocessing/ and eda/."""
+"""Data-phase routes: upload + audit, charts, cleaning, preprocessing, downloads,
+sample datasets. Routes only -- the work happens in preprocessing/ and eda/.
+Every route is behind api.auth.owner_guard (signed in + owns the dataset), except
+`public` (upload limits, shown before sign-in)."""
 
 import io
 import json
 
 import joblib
-from fastapi import APIRouter, Body, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, HTTPException, Response, UploadFile
 
-from api.common import ALLOWED, frame_or_404, read_table
+from api.auth import owner_guard
+from api.common import ALLOWED, _payload, frame_or_404, read_table
 from core import config, store
 from eda import plot
-from eda.charts import chart_data
-from eda.eda import render_charts
+from models.user import User
 from preprocessing import clean, execute
-from preprocessing.detector import run_quality_report
-from preprocessing.profiler import profile_dataset
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(owner_guard)])
+public = APIRouter()
 
-
-def _payload(df, filename, ds_id):
-    """The full analyze response for a frame: profile + quality report + charts +
-    a small row sample (for the Cleaning tab's preview grid). Shared by
-    /api/analyze and /api/clean so cleaned data re-renders identically."""
-    return {"id": ds_id, "filename": filename,
-            "profile": profile_dataset(df),
-            "report": run_quality_report(df),
-            "charts": chart_data(df),
-            "eda": render_charts(df),
-            "sample": json.loads(df.head(50).to_json(orient="records")),
-            "preprocess_options": execute.options(),
-            "can_reset": store.has_original(ds_id)}
+# Bundled with scikit-learn (read from the installed package, no download):
+# key -> (loader, kwargs, target column name, title, task)
+SAMPLES = {
+    "breast_cancer": ("load_breast_cancer", {}, "diagnosis", "Breast cancer diagnosis (Wisconsin)", "classification"),
+    "diabetes": ("load_diabetes", {"scaled": False}, "progression", "Diabetes progression", "regression"),
+    "iris": ("load_iris", {}, "species", "Iris flowers", "classification"),
+    "wine": ("load_wine", {}, "cultivar", "Wine cultivars", "classification"),
+}
 
 
-@router.get("/api/upload/limits")
+@public.get("/api/upload/limits")
 def upload_limits():
     """What the upload page may accept -- read from the backend so the page never
     keeps its own copy (MAX_UPLOAD_MB lives in backend/.env)."""
-    return {"max_mb": config.MAX_UPLOAD_MB, "allowed": sorted(ALLOWED)}
+    return {"max_mb": config.MAX_UPLOAD_MB, "allowed": sorted(ALLOWED), "samples":
+            [{"key": k, "title": v[3], "task": v[4], "target": v[2]} for k, v in SAMPLES.items()]}
 
 
 @router.post("/api/analyze")
-async def analyze(file: UploadFile):
-    df = await read_table(file)
-    ds_id = store.create(df, file.filename)
-    return _payload(df, file.filename, ds_id)
+async def analyze(file: UploadFile, user: User = Depends(owner_guard)):
+    notes = []
+    df = await read_table(file, notes)
+    ds_id = store.create(df, file.filename, owner=user.id)
+    return {**_payload(df, file.filename, ds_id), "load_notes": notes}
+
+
+@router.post("/api/samples/{name}")
+def load_sample(name: str, user: User = Depends(owner_guard)):
+    """Create a dataset from a sample bundled with scikit-learn."""
+    if name not in SAMPLES:
+        raise HTTPException(404, "Unknown sample dataset.")
+    from sklearn import datasets
+    loader, kwargs, target, title, task = SAMPLES[name]
+    bunch = getattr(datasets, loader)(as_frame=True, **kwargs)
+    df = bunch.frame.rename(columns={"target": target})
+    names = getattr(bunch, "target_names", None)
+    if task == "classification" and names is not None:
+        df[target] = [str(names[i]) for i in df[target]]
+    filename = f"{name}.csv"
+    ds_id = store.create(df, filename, owner=user.id, title=title)
+    return {**_payload(df, filename, ds_id), "load_notes": [f"sample dataset bundled with scikit-learn ({loader})"],
+            "suggested": {"target": target, "task": task}}
 
 
 @router.get("/api/chart")
@@ -68,6 +84,7 @@ def do_clean(payload: dict = Body(...)):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     store.save_frame(payload["id"], cleaned)  # downstream tabs now see the cleaned frame
+    # ops carry the decisions apply_clean made (date order, comma meaning) -> replayed identically
     store.add_clean_ops(payload["id"], payload.get("ops", []))
     out = _payload(cleaned, payload.get("filename", "cleaned"), payload["id"])
     out["clean_summary"] = summary
@@ -89,19 +106,22 @@ def reset_clean(payload: dict = Body(...)):
 def do_preprocess(payload: dict = Body(...)):
     """Apply a validated per-column op plan (fit on train only), return a preview
     + change summary. Body: {id, target, task, columns, test_size?, random_state?,
-    stratify?}. Split settings fall back to execute.TEST_SIZE / RANDOM_STATE. The cleaned CSV and
-    fitted pipeline are saved for /api/download and /api/pipeline."""
+    stratify?, group?}. Clustering needs no target. Split settings fall back to
+    execute.TEST_SIZE / RANDOM_STATE. The cleaned CSV and fitted pipeline are saved
+    for /api/download and /api/pipeline."""
     df = frame_or_404(payload.get("id"))
-    if not payload.get("target"):
+    task = payload.get("task", "classification")
+    if not payload.get("target") and task != "clustering":
         raise HTTPException(422, "No target column given.")
     try:
         result = execute.apply_plan(
-            df, payload["target"], payload.get("columns", {}),
-            task=payload.get("task", "classification"),
+            df, payload.get("target"), payload.get("columns", {}),
+            task=task,
             pipeline=payload.get("pipeline"),
             test_size=payload.get("test_size"),
             random_state=payload.get("random_state"),
             stratify=payload.get("stratify", execute.STRATIFY),
+            group=payload.get("group") or None,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None

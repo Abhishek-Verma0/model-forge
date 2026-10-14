@@ -361,9 +361,13 @@ def detect_id_columns(df, id_ratio_threshold=None):
         distinct = int(clean.nunique())
         unique_ratio = distinct / total_rows
 
-        # every review is unique too, but sentences aren't identifiers
+        # every review is unique too, but sentences aren't identifiers -- and neither
+        # are measurements: an ID is a whole number or a label, never 27.3 (a unique
+        # float column -- bmi, price, a regression target -- was pre-ticked for drop)
+        numeric = is_numeric(series)
         if (unique_ratio >= id_ratio_threshold
-                and (is_numeric(series) or text_kind(series) != "free_text")):
+                and ((numeric and bool((clean % 1 == 0).all()))
+                     or (not numeric and text_kind(series) != "free_text"))):
             id_columns.append({
                 "column": column,
                 "distinct_values": distinct,
@@ -689,5 +693,7 @@ if __name__ == "__main__":
     assert kinds == {"review": "free_text", "cpu": None, "code": "string"}, kinds  # cpu: few labels -> categorical
     ids = [c["column"] for c in detect_id_columns(t)["columns"]]
     assert "review" not in ids and "code" in ids, ids
+    m = pd.DataFrame({"row_id": range(60), "bmi": [18.5 + i * 0.37 for i in range(60)]})
+    assert [c["column"] for c in detect_id_columns(m)["columns"]] == ["row_id"]   # unique floats are measurements
     print(f"quality score self-check passed: clean={cs['score']} ({cs['grade']}) "
           f"dirty={ds['score']} ({ds['grade']}) because {[d['reason'] for d in ds['deductions']]}")

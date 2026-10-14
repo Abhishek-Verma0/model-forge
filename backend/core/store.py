@@ -2,13 +2,14 @@
 upload loses nothing. Layout under ROOT:
 
   <dataset_id>/frame.pkl          current table (after cleaning)
-  <dataset_id>/meta.json          {"filename", "created", "clean_ops": [...]}
+  <dataset_id>/meta.json          {"filename", "title", "owner", "kind", "created", "clean_ops": [...]}
   <dataset_id>/prep.joblib        {"csv", "fitted"} from the last preprocessing run
   <dataset_id>/runs/<run_id>/     one folder per training run (jobs.py)
 
 pickle/joblib keep pandas dtypes exactly, but can run code when loaded -- so this
 module only loads files it wrote, and every id is validated before it becomes a
-path. ponytail: no deletion/retention yet (plan §24) -- add with auth.
+path. Every dataset has an owner (a user id); only the owner reaches it (api/auth.py
+guard). The owner can delete it, and DATA_RETENTION_DAYS removes stale ones (plan §24).
 """
 
 import json
@@ -65,13 +66,82 @@ def _remember(ds_id, df):
         _cache.popitem(last=False)
 
 
-def create(df, filename):
+def create(df, filename, owner=None, title=None, kind="dataset"):
+    """kind: "dataset" (the analysis workflow) or "bibliometric" (publication records)."""
     ds_id = _new_id()
     _dir(ds_id).mkdir(parents=True)
-    write_json(_dir(ds_id) / "meta.json", {"filename": filename, "created": time.time(), "clean_ops": []})
+    write_json(_dir(ds_id) / "meta.json", {"filename": filename, "title": (title or filename), "owner": owner,
+                                           "kind": kind, "created": time.time(), "clean_ops": []})
     save_frame(ds_id, df)
     df.to_pickle(_dir(ds_id) / "original.pkl")   # never overwritten: what "reset" restores
     return ds_id
+
+
+def owned_by(ds_id, user_id):
+    """True only for an existing dataset of this user. Datasets created before
+    accounts existed have no owner and belong to nobody."""
+    m = meta(ds_id)
+    return bool(m) and m.get("owner") is not None and m.get("owner") == user_id
+
+
+def datasets(owner):
+    """This user's datasets, newest change first: id, title, kind, rows/columns, runs."""
+    out = []
+    for p in ROOT.iterdir() if ROOT.exists() else []:
+        if not _ID.fullmatch(p.name):
+            continue
+        m = read_json(p / "meta.json") or {}
+        if m.get("owner") != owner:
+            continue
+        frame = _cache.get(p.name)
+        out.append({"id": p.name, "title": m.get("title") or m.get("filename"), "filename": m.get("filename"),
+                    "kind": m.get("kind", "dataset"), "created": m.get("created"), "updated": _touched(p),
+                    "shape": m.get("shape") or (list(frame.shape) if frame is not None else None),
+                    "runs": sum(1 for r in run_ids(p.name)   # training runs, not explanation / curve jobs
+                                if (read_json(p / "runs" / r / "settings.json") or {}).get("kind") in ("train", "tune", "cluster")),
+                    "saved_models": len(model_ids(p.name)),
+                    "preprocessed": (p / "prep.joblib").exists(), "size_mb": size_mb(p)})
+    return sorted(out, key=lambda d: d["updated"], reverse=True)
+
+
+def _touched(path):
+    return max((f.stat().st_mtime for f in path.rglob("*") if f.is_file()), default=path.stat().st_mtime)
+
+
+def update_meta(ds_id, **fields):
+    with _lock:
+        m = meta(ds_id)
+        m.update(fields)
+        write_json(_dir(ds_id) / "meta.json", m)
+
+
+def rename(ds_id, title):
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("Give the project a name.")
+    with _lock:
+        m = meta(ds_id)
+        m["title"] = title[:200]
+        write_json(_dir(ds_id) / "meta.json", m)
+
+
+def delete_dataset(ds_id):
+    """Remove a dataset and everything made from it (runs, models, results)."""
+    path = _dir(ds_id)
+    _cache.pop(ds_id, None)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def sweep(days, now=None):
+    """Delete datasets not changed for `days` days (0 = keep everything). Returns
+    the ids removed. Runs at startup (app.py)."""
+    if days <= 0 or not ROOT.exists():
+        return []
+    cutoff = (now or time.time()) - days * 86400
+    gone = [p.name for p in ROOT.iterdir() if _ID.fullmatch(p.name) and _touched(p) < cutoff]
+    for ds_id in gone:
+        delete_dataset(ds_id)
+    return gone
 
 
 def has_original(ds_id):
@@ -99,6 +169,11 @@ def save_frame(ds_id, df):
     df.to_pickle(tmp)
     tmp.replace(path)
     _remember(ds_id, df)
+    with _lock:   # the project list shows the shape without loading every table
+        m = meta(ds_id)
+        if m is not None:
+            m["shape"] = list(df.shape)
+            write_json(_dir(ds_id) / "meta.json", m)
 
 
 def load_frame(ds_id):
@@ -195,6 +270,34 @@ def suggestion_path(ds_id, key):
     return folder / f"{_check(key)}.json"
 
 
+_ANALYSES = {"stats", "biblio"}   # folders of saved analysis results inside a dataset
+
+
+def save_analysis(ds_id, kind, result):
+    """Keep one analysis result (statistics, bibliometrics) for the history and the report."""
+    if kind not in _ANALYSES:
+        raise KeyError(kind)
+    folder = _dir(ds_id) / kind
+    folder.mkdir(exist_ok=True)
+    a_id = _new_id()
+    write_json(folder / f"{a_id}.json", {**result, "id": a_id, "created": time.time()})
+    return a_id
+
+
+def analyses(ds_id, kind):
+    if kind not in _ANALYSES:
+        raise KeyError(kind)
+    folder = _dir(ds_id) / kind
+    out = [read_json(p) for p in folder.glob("*.json") if _ID.fullmatch(p.stem)] if folder.exists() else []
+    return sorted([a for a in out if a], key=lambda a: a["created"], reverse=True)
+
+
+def delete_analysis(ds_id, kind, a_id):
+    if kind not in _ANALYSES:
+        raise KeyError(kind)
+    (_dir(ds_id) / kind / f"{_check(a_id)}.json").unlink(missing_ok=True)
+
+
 def size_mb(path):
     path = Path(path)
     files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()] if path.exists() else []
@@ -237,4 +340,29 @@ if __name__ == "__main__":
     for _ in range(CACHE_CAP + 2):
         create(df, "x.csv")
     assert len(_cache) == CACHE_CAP
+
+    # ownership, projects, deletion, retention
+    mine = create(df, "mine.csv", owner=7, title="My study")
+    assert owned_by(mine, 7) and not owned_by(mine, 8) and not owned_by(ds, 7)   # ds: no owner = nobody's
+    assert not owned_by("../../etc", 7)
+    listed = datasets(7)
+    assert [d["id"] for d in listed] == [mine] and listed[0]["title"] == "My study" and listed[0]["shape"] == [3, 2]
+    rename(mine, "  Renamed  ")
+    assert datasets(7)[0]["title"] == "Renamed"
+    delete_dataset(mine)
+    assert datasets(7) == [] and load_frame(mine) is None
+    old = create(df, "old.csv", owner=7)
+    assert sweep(0) == [] and sweep(30) == []                        # fresh data is kept
+    assert sweep(30, now=time.time() + 31 * 86400) and load_frame(old) is None
+    ds = create(df, "a.csv", owner=7)                     # the sweep above removed the others
+    a = save_analysis(ds, "stats", {"analysis": "describe"})
+    assert [x["id"] for x in analyses(ds, "stats")] == [a]
+    delete_analysis(ds, "stats", a)
+    assert analyses(ds, "stats") == []
+    for bad in (lambda: analyses(ds, "../x"), lambda: delete_analysis(ds, "stats", "../../meta")):
+        try:
+            bad()
+            raise AssertionError("bad name accepted")
+        except KeyError:
+            pass
     print("store self-check passed")

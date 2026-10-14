@@ -4,14 +4,16 @@ Routes only -- the work happens in inference/."""
 
 import io
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 
+from api.auth import owner_guard
 from api.common import read_table
 from inference import predict as P
 from inference import registry
 
-router = APIRouter()
+
+router = APIRouter(dependencies=[Depends(owner_guard)])  # signed in + owns the dataset
 
 
 def _call(fn, *args, **kwargs):

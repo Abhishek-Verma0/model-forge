@@ -11,7 +11,7 @@ from imblearn.pipeline import Pipeline
 from imblearn.under_sampling import RandomUnderSampler
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.ensemble import IsolationForest
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from preprocessing import advanced, execute
 from training import epochs
@@ -118,7 +118,7 @@ def transform_steps(steps, X):
     return X
 
 
-def fit_fold(pipe, row, fit, X, y, share, seed, task, on_epoch, check, classes=None):
+def fit_fold(pipe, row, fit, X, y, share, seed, task, on_epoch, check, classes=None, groups=None):
     """Fit one pipeline on rows (X, y) and return (fitted Pipeline, epoch info).
 
     Epoch-based models with share > 0 first hold back `share` of these RAW rows --

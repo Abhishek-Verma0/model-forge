@@ -27,9 +27,10 @@ def _specificity(y_true, y_pred, labels):
     return float(np.mean(tn / np.maximum(tn + fp, 1)))
 
 
-def scorers(task, n_classes, pos_label, has_proba, target_has_zero):
+def scorers(task, n_classes, pos_label, has_proba, target_has_zero, has_scores=True):
     """metric -> scikit-learn scorer, only for metrics this model and data can
-    produce (the rest show as n/a)."""
+    produce (the rest show as n/a). has_scores: the model has predict_proba or
+    decision_function -- a hard-voting ensemble has neither, so no AUC."""
     if task == "regression":
         s = {"mae": "neg_mean_absolute_error", "mse": "neg_mean_squared_error",
              "rmse": "neg_root_mean_squared_error", "r2": "r2"}
@@ -43,10 +44,12 @@ def scorers(task, n_classes, pos_label, has_proba, target_has_zero):
             precision=make_scorer(precision_score, pos_label=pos_label, zero_division=0),
             recall=make_scorer(recall_score, pos_label=pos_label, zero_division=0),
             specificity=make_scorer(recall_score, pos_label=1 - pos_label, zero_division=0),
-            f1=make_scorer(f1_score, pos_label=pos_label, zero_division=0),
-            roc_auc="roc_auc",  # the same for either class
-            pr_auc=make_scorer(average_precision_score, response_method=("decision_function", "predict_proba"),
-                               pos_label=pos_label))
+            f1=make_scorer(f1_score, pos_label=pos_label, zero_division=0))
+        if has_proba or has_scores:
+            s.update(
+                roc_auc="roc_auc",  # the same for either class
+                pr_auc=make_scorer(average_precision_score, response_method=("decision_function", "predict_proba"),
+                                   pos_label=pos_label))
     else:
         labels = list(range(n_classes))
         s.update(

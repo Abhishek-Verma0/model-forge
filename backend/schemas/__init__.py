@@ -1,5 +1,7 @@
 from schemas.auth import (
+    ForgotPasswordRequest,
     GoogleAuthRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UserLoginRequest,
     UserRegisterRequest,
@@ -7,7 +9,9 @@ from schemas.auth import (
 )
 
 __all__ = [
+    "ForgotPasswordRequest",
     "GoogleAuthRequest",
+    "ResetPasswordRequest",
     "TokenResponse",
     "UserLoginRequest",
     "UserRegisterRequest",
