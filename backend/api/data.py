@@ -11,13 +11,14 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Response, UploadFil
 
 from api.auth import owner_guard
 from api.common import ALLOWED, _payload, frame_or_404, read_table
-from core import config, store
+from core import config, logs, store
 from eda import plot
 from models.user import User
 from preprocessing import clean, execute
 
 router = APIRouter(dependencies=[Depends(owner_guard)])
 public = APIRouter()
+log = logs.get("data")
 
 # Bundled with scikit-learn (read from the installed package, no download):
 # key -> (loader, kwargs, target column name, title, task)
@@ -79,13 +80,19 @@ def do_clean(payload: dict = Body(...)):
     save the cleaned frame, and return the re-profiled payload + a summary.
     Body: {id, ops}."""
     df = frame_or_404(payload.get("id"))
+    ops = payload.get("ops", [])
+    listed = "; ".join(f"{o.get('op')} {o.get('column') or ''}".strip() for o in ops)
+    log.info("clean %s (%s rows x %d columns): %d operation(s)%s", payload.get("id"), f"{df.shape[0]:,}", df.shape[1],
+             len(ops), f": {listed[:300]}{' ...' if len(listed) > 300 else ''}" if ops else "")
     try:
-        cleaned, summary = clean.apply_clean(df, payload.get("ops", []))
+        with logs.step(log, "apply cleaning"):
+            cleaned, summary = clean.apply_clean(df, ops)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    store.save_frame(payload["id"], cleaned)  # downstream tabs now see the cleaned frame
-    # ops carry the decisions apply_clean made (date order, comma meaning) -> replayed identically
-    store.add_clean_ops(payload["id"], payload.get("ops", []))
+    with logs.step(log, "save cleaned table"):
+        store.save_frame(payload["id"], cleaned)  # downstream tabs now see the cleaned frame
+        # ops carry the decisions apply_clean made (date order, comma meaning) -> replayed identically
+        store.add_clean_ops(payload["id"], ops)
     out = _payload(cleaned, payload.get("filename", "cleaned"), payload["id"])
     out["clean_summary"] = summary
     return out
@@ -114,15 +121,16 @@ def do_preprocess(payload: dict = Body(...)):
     if not payload.get("target") and task != "clustering":
         raise HTTPException(422, "No target column given.")
     try:
-        result = execute.apply_plan(
-            df, payload.get("target"), payload.get("columns", {}),
-            task=task,
-            pipeline=payload.get("pipeline"),
-            test_size=payload.get("test_size"),
-            random_state=payload.get("random_state"),
-            stratify=payload.get("stratify", execute.STRATIFY),
-            group=payload.get("group") or None,
-        )
+        with logs.step(log, f"preprocess {payload.get('id')} (target {payload.get('target') or 'none'}, {task})"):
+            result = execute.apply_plan(
+                df, payload.get("target"), payload.get("columns", {}),
+                task=task,
+                pipeline=payload.get("pipeline"),
+                test_size=payload.get("test_size"),
+                random_state=payload.get("random_state"),
+                stratify=payload.get("stratify", execute.STRATIFY),
+                group=payload.get("group") or None,
+            )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     fitted = result.pop("fitted")

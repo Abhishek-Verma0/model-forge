@@ -138,12 +138,17 @@ export default function Train({ data, target, active, onResults, onAsk, onTraine
     } catch (e) { setErr(e.message); }
   }
 
+  // Tick exactly these models, switch the search on and bring its settings into view.
+  function tuneOnly(keys) {
+    setPicked(keys); setTouched(true); setTuneOn(true);
+    setTimeout(() => document.getElementById("tune-settings")?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+  }
+
   async function tuneLeaders() {
     try {
       const keys = await call(`/api/run/leaders?id=${data.id}&run=${run.id}&k=${LEADERS_K}`);
       if (!keys.length) { setErr("No model beat the baseline, so there is nothing to tune."); return; }
-      setPicked(keys); setTouched(true); setTuneOn(true);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      tuneOnly(keys);
     } catch (e) { setErr(e.message); }
   }
 
@@ -235,7 +240,7 @@ export default function Train({ data, target, active, onResults, onAsk, onTraine
 
       <EnsemblePicker kinds={opt.ensembles || {}} models={opt.models} value={ensembles} onChange={setEnsembles} disabled={running} />
 
-      <label style={{ display: "flex", gap: 8, alignItems: "center", margin: "12px 0 8px" }}>
+      <label id="tune-settings" style={{ display: "flex", gap: 8, alignItems: "center", margin: "12px 0 8px", scrollMarginTop: 80 }}>
         <input type="checkbox" checked={tuneOn} disabled={running} onChange={(e) => setTuneOn(e.target.checked)} />
         <b>Search hyperparameters for the ticked models</b> <span className="note">(grid or random search, plan §10)</span>
       </label>
@@ -273,7 +278,8 @@ export default function Train({ data, target, active, onResults, onAsk, onTraine
                  onCurves={(key) => showCurves(run, key)} onAsk={onAsk}
                  onPanel={(kind, key) => (kind === "charts" ? showCharts(key) : setPanel({ kind, key }))}
                  onDownload={() => download(`/api/run/model?id=${data.id}&run=${run.id}`, "best_model.joblib").catch((e) => setErr(e.message))}
-                 onTuneLeaders={run?.kind === "train" && !running ? tuneLeaders : null} />
+                 onTuneLeaders={run?.kind === "train" && !running ? tuneLeaders : null}
+                 onTune={running ? null : (key) => tuneOnly([key])} />
       )}
       {panel?.kind === "charts" && (
         <div style={{ marginTop: 10 }}>
@@ -299,7 +305,7 @@ export default function Train({ data, target, active, onResults, onAsk, onTraine
   );
 }
 
-function Results({ results, metrics, models, done, onCurves, onPanel, onAsk, onDownload, onTuneLeaders }) {
+function Results({ results, metrics, models, done, onCurves, onPanel, onAsk, onDownload, onTuneLeaders, onTune }) {
   const primary = results.primary_metric;
   const meta = Object.fromEntries(metrics.map((m) => [m.key, m]));
   const higher = meta[primary]?.higher_is_better ?? true;
@@ -344,6 +350,10 @@ function Results({ results, metrics, models, done, onCurves, onPanel, onAsk, onD
                     {!r.baseline && <button className="ghost" onClick={() => onPanel("charts", r.key)}>Charts</button>}
                     {!r.baseline && <button className="ghost" onClick={() => onPanel("explain", r.key)}>Explain</button>}
                     {!r.baseline && <button className="ghost" onClick={() => onPanel("curves", r.key)}>Learning curves</button>}
+                    {onTune && !r.baseline && models.some((m) => m.key === r.key) && (
+                      <button className="ghost" onClick={() => onTune(r.key)}
+                              title="Tick only this model and open the hyperparameter search">Tune</button>
+                    )}
                     {onAsk && <button className="ghost" onClick={() => onAsk(`How well does ${r.label} work? Compare its train, CV and test scores - did it overfit?`)}>Ask AI</button>}
                   </div>
                 )}

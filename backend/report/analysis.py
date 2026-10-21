@@ -289,6 +289,11 @@ def pdf(ds_id, run_id=None):
     types = {c["column"]: c["detected_type"] for c in quality["checks"]["column_types"]["columns"]}
     doc.heading("1. Dataset description")
     doc.para(f"{df.shape[0]:,} rows and {df.shape[1]} columns; {profile['duplicate_rows']:,} duplicate row(s).")
+    doc.para(f"Ethics approval / consent (plan §24, entered by the researcher): {m.get('ethics') or 'not recorded'}.", 8)
+    personal = quality["checks"]["personal_data"]["columns"]
+    if personal:
+        doc.para("Possible personal data: " + ", ".join(f"{p['column']} ({p['kind']})" for p in personal)
+                 + ". Check that its use is covered by consent or remove it.", 8, color="#9a3412")
     info = profile["columns_info"]
     doc.table(["Column", "Type", "Missing %", "Distinct", "Min", "Max", "Mean"],
               [[c, types.get(c), info[c]["missing_percent"], info[c]["unique_values"],
@@ -376,7 +381,7 @@ def json_export(ds_id, run_id=None):
     """§15 JSON: experiment configuration and results."""
     g = gather(ds_id, run_id)
     prep = g["prep"]
-    return {"dataset": {k: g["meta"].get(k) for k in ("title", "filename", "created", "shape")},
+    return {"dataset": {k: g["meta"].get(k) for k in ("title", "filename", "created", "shape", "ethics")},
             "clean_ops": g["meta"].get("clean_ops"),
             "preprocessing": prep["fitted"]["settings"] if prep else None,
             "run": {"id": g["run_id"], "settings": g["settings"], "results": g["results"]},

@@ -66,12 +66,35 @@ function CatBar({ name, topValues }) {
   );
 }
 
+// WCAG 2 relative luminance of an [r, g, b] colour (0-255)
+const luminance = (rgb) => {
+  const [r, g, b] = rgb.map((c) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+// Black, not --text #1F1C18: as a cell's tint goes from pale to full, it passes the shade where white
+// and dark text read equally well. There the best contrast is sqrt(1.05 / (dark + 0.05)): 4.10:1
+// with #1F1C18, 4.58:1 with black -- so with black every r from -1 to 1 meets WCAG AA (4.5:1).
+const TEXT_DARK = [0, 0, 0];
+const contrast = (a, b) => (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+
 function Heatmap({ correlation }) {
   const { columns, matrix } = correlation;
+  // blue = +, red = −, stronger = more opaque over the white panel
+  const base = (v) => (v >= 0 ? [79, 70, 229] : [220, 38, 38]);
   const color = (v) => {
     if (v == null) return "var(--border)";
+    return `rgba(${base(v).join(",")},${Math.min(Math.abs(v), 1)})`;
+  };
+  // the number takes whichever of white or dark text contrasts more with its cell: near 0 the
+  // cell is almost white, and the old always-white numbers vanished there
+  const ink = (v) => {
+    if (v == null) return undefined;
     const a = Math.min(Math.abs(v), 1);
-    return v >= 0 ? `rgba(79,70,229,${a})` : `rgba(220,38,38,${a})`; // blue = +, red = −
+    const cell = luminance(base(v).map((c) => 255 - a * (255 - c)));   // the tint as drawn over #FFFFFF
+    return contrast(cell, 1) >= contrast(cell, luminance(TEXT_DARK)) ? "#fff" : "#000";
   };
   return (
     <div
@@ -93,7 +116,7 @@ function Heatmap({ correlation }) {
             <div
               key={j}
               className="hm-cell"
-              style={{ background: color(v) }}
+              style={{ background: color(v), color: ink(v) }}
               title={`${columns[i]} × ${columns[j]}: ${v ?? "—"}`}
             >
               {v == null ? "" : v.toFixed(2)}

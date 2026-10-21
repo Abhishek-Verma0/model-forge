@@ -1,3 +1,4 @@
+import re
 import warnings
 
 import pandas as pd
@@ -11,6 +12,14 @@ IQR_MULTIPLIER = 1.5          # published default: Tukey's fences, Q1/Q3 -/+ 1.5
 CATEGORICAL_THRESHOLD = 0.5   # our starting point: categorical needs distinct/rows at or below this...
 MAX_CATEGORICAL_UNIQUE = 50   # our starting point: ...and at most this many distinct values (also the one-hot limit)
 ID_RATIO_THRESHOLD = 0.95     # our starting point: distinct/rows share at which a column looks like an ID
+# A number ID is a row counter: whole numbers spread about one per row (1, 2, 3 ...). Counts are
+# whole and unique too but spread far wider -- (max - min + 1) / distinct measured 2026-10-21 on the
+# uploads here: the counter (laptopData "Unnamed: 0") 1.02; views, subscriber_count, volume,
+# volume_sma_20 8,369 to 1,340,002. Our starting point: at most 2.
+# ponytail: random number codes (8-digit customer ids, ~25) are missed -- by value they can't be told
+# from random measurements (salaries of 2,000 people spread ~50, measured), and a missed ID costs less
+# than a real feature pre-ticked for dropping; the researcher can still drop it on the Cleaning step.
+ID_SPAN_MAX = 2.0
 CARDINALITY_THRESHOLD = 0.5   # our starting point: distinct/rows share flagged as high cardinality
 CARDINALITY_MIN_UNIQUE = 20   # our starting point: ...and at least this many distinct values
 # Free text = most values distinct AND a typical cell holds several words
@@ -18,6 +27,15 @@ CARDINALITY_MIN_UNIQUE = 20   # our starting point: ...and at least this many di
 # strings -- cities, CPU models, codes -- are "string": short fragments that repeat.
 FREETEXT_MIN_UNIQUE = 0.5  # our starting point
 FREETEXT_MIN_WORDS = 3  # our starting point -- ponytail: median words per cell; 2-word names stay ID-like
+# Personal data (plan §24 "detect possible identifiers and warn"): a text column whose values
+# mostly look like e-mail addresses or formatted phone numbers.
+PERSONAL_MIN_SHARE = 0.5     # our starting point: share of non-empty values that must match
+PERSONAL_SAMPLE = 1000       # our starting point: non-empty values checked per column
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# a phone number has 7-15 digits (ITU-T E.164 allows at most 15) and some formatting (+, space, dash,
+# brackets); plain digit strings are left to the ID-column check, which flags unique text codes
+# (a code stored as a number is flagged only when it counts like a row number -- see ID_SPAN_MAX)
+_PHONE = re.compile(r"^\+?[\d\s().-]+$")
 
 
 def detect_missing_values(df, detect_empty_strings=True):
@@ -233,6 +251,31 @@ _BOOLEAN_VALUE_SETS = [
 # pd.to_datetime(format="mixed") parses one value at a time in Python (~10s on
 # a large text column, which is what hung the whole report).
 DATETIME_SAMPLE = 1000  # our starting point
+DATETIME_SHARE = 0.8    # our starting point: share of the sample that must parse as dates
+# A date carries a year: a standalone 4-digit number (2020-01-22, Jan 22 2020, 22.01.2020 10:00) or
+# day-month-year with a 2-digit year (25.12.20). pandas' lenient parser also reads month names ("Jan"),
+# clock times ("08:00"), scores ("2-1") and versions ("1.2.3") -- verified 2026-10-21; those are labels,
+# and the cleaning reader (clean.to_datetime) fails or invents dates on them.
+_YEAR = re.compile(r"(?<!\d)\d{4}(?!\d)|^\s*\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2}(?!\d)")
+
+
+def looks_like_dates(series):
+    """True for a datetime column, or text whose sampled values mostly parse as dates and
+    carry a year. One rule for the column-type, ID and high-cardinality checks: a date column
+    is a date -- not an ID, not a many-valued label (ydata-profiling gives it its own "Date" alert)."""
+    clean = series.dropna()
+    if pd.api.types.is_datetime64_any_dtype(clean):
+        return True
+    if clean.empty or is_numeric(clean) or pd.api.types.is_bool_dtype(clean):
+        return False
+    # Sample, don't scan: parse a random 1,000 values, not all of them.
+    # random_state fixes the sample so the type is stable across runs.
+    probe = clean if len(clean) <= DATETIME_SAMPLE else clean.sample(DATETIME_SAMPLE, random_state=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = pd.to_datetime(probe, errors="coerce", format="mixed")
+    return bool(parsed.notna().mean() >= DATETIME_SHARE
+                and probe.astype(str).str.contains(_YEAR).mean() >= DATETIME_SHARE)
 
 
 def text_kind(series):
@@ -286,20 +329,7 @@ def detect_column_types(df, categorical_threshold=None, max_categorical_unique=N
             semantic_type = "numeric"
 
         else:
-            is_datetime = False
-            if not clean.empty:
-                # Sample, don't scan: parse a random 1,000 values, not all of them.
-                # random_state fixes the sample so the type is stable across runs.
-                probe = clean if len(clean) <= DATETIME_SAMPLE else clean.sample(
-                    DATETIME_SAMPLE, random_state=0
-                )
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    parsed = pd.to_datetime(probe, errors="coerce", format="mixed")
-                if parsed.notna().mean() >= 0.8:
-                    is_datetime = True
-
-            if is_datetime:
+            if looks_like_dates(series):
                 semantic_type = "datetime"
             elif distinct <= max_categorical_unique and unique_ratio <= categorical_threshold:
                 semantic_type = "categorical"
@@ -361,13 +391,17 @@ def detect_id_columns(df, id_ratio_threshold=None):
         distinct = int(clean.nunique())
         unique_ratio = distinct / total_rows
 
+        if unique_ratio < id_ratio_threshold:
+            continue
         # every review is unique too, but sentences aren't identifiers -- and neither
-        # are measurements: an ID is a whole number or a label, never 27.3 (a unique
-        # float column -- bmi, price, a regression target -- was pre-ticked for drop)
-        numeric = is_numeric(series)
-        if (unique_ratio >= id_ratio_threshold
-                and ((numeric and bool((clean % 1 == 0).all()))
-                     or (not numeric and text_kind(series) != "free_text"))):
+        # are measurements or dates: an ID is a row counter (never 27.3 or a count like
+        # views: those were pre-ticked for drop) or a label that is not a date
+        if is_numeric(series):
+            is_id = bool((clean % 1 == 0).all()) and \
+                float(clean.max()) - float(clean.min()) + 1 <= ID_SPAN_MAX * distinct
+        else:
+            is_id = text_kind(series) != "free_text" and not looks_like_dates(series)
+        if is_id:
             id_columns.append({
                 "column": column,
                 "distinct_values": distinct,
@@ -428,7 +462,8 @@ def detect_high_cardinality(df, cardinality_threshold=None, min_unique=None):
         distinct = int(clean.nunique())
         unique_ratio = distinct / total_rows
 
-        if distinct >= min_unique and unique_ratio >= cardinality_threshold:
+        # dates have many values by nature -- not a labelling problem (checked last: it parses a sample)
+        if distinct >= min_unique and unique_ratio >= cardinality_threshold and not looks_like_dates(series):
             high_cardinality_columns.append({
                 "column": column,
                 "distinct_values": distinct,
@@ -588,6 +623,31 @@ def detect_consistency_issues(df):
     }
 
 
+def _is_phone(v):
+    digits = sum(ch.isdigit() for ch in v)
+    return bool(_PHONE.match(v)) and 7 <= digits <= 15 and any(ch in v for ch in "+ ()-.")
+
+
+def detect_personal_data(df):
+    """Text columns that hold e-mail addresses or phone numbers -> {has_personal_data, columns}.
+    Not scored: it is a privacy warning, not a data-quality problem."""
+    found = []
+    for col in df.columns:
+        s = df[col]
+        if is_numeric(s):
+            continue
+        vals = s.dropna().astype(str).str.strip()
+        vals = vals[vals != ""].head(PERSONAL_SAMPLE)
+        if vals.empty:
+            continue
+        for kind, test in (("email", lambda v: bool(_EMAIL.match(v))), ("phone", _is_phone)):
+            share = sum(map(test, vals)) / len(vals)
+            if share >= PERSONAL_MIN_SHARE:
+                found.append({"column": col, "kind": kind, "share": round(share, 3)})
+                break
+    return {"has_personal_data": bool(found), "columns": found}
+
+
 def quality_score(checks, df):
     """0-100 dataset health, from checks already computed -- no second pass.
 
@@ -646,6 +706,7 @@ def run_quality_report(df):
         "high_cardinality": detect_high_cardinality(df),
         "value_issues": detect_value_issues(df),
         "consistency_issues": detect_consistency_issues(df),
+        "personal_data": detect_personal_data(df),
     }
 
     issues_found = {
@@ -695,5 +756,25 @@ if __name__ == "__main__":
     assert "review" not in ids and "code" in ids, ids
     m = pd.DataFrame({"row_id": range(60), "bmi": [18.5 + i * 0.37 for i in range(60)]})
     assert [c["column"] for c in detect_id_columns(m)["columns"]] == ["row_id"]   # unique floats are measurements
+    pdat = pd.DataFrame({"mail": ["a.b@uni.edu", "x@y.org", None], "tel": ["+91 98765 43210", "(020) 7946-0958", ""],
+                         "code": ["1234567", "7654321", "1111111"], "note": ["ok", "fine", "x"]})
+    assert detect_personal_data(pdat)["columns"] == [{"column": "mail", "kind": "email", "share": 1.0},
+                                                     {"column": "tel", "kind": "phone", "share": 1.0}]
+    # a date is a date and a count is a count -- neither is an ID (both were pre-ticked for drop);
+    # a row counter and a label code still are
+    w = pd.DataFrame({"date": pd.date_range("2020-01-01", periods=300).strftime("%Y-%m-%d"),
+                      "views": [139 + i * 16805 for i in range(300)], "row": range(300),
+                      "vid": [f"vid_{i:06d}" for i in range(300)]})
+    assert [c["column"] for c in detect_id_columns(w)["columns"]] == ["row", "vid"], detect_id_columns(w)
+    assert [c["column"] for c in detect_id_columns(w.assign(date=pd.to_datetime(w["date"])))["columns"]] == ["row", "vid"]
+    assert [c["column"] for c in detect_high_cardinality(w)["columns"]] == ["vid"]
+    assert {c["column"]: c["detected_type"] for c in detect_column_types(w)["columns"]}["date"] == "datetime"
+    # labels pandas' lenient parser reads as dates are not dates; dates with a zone or a 2-digit year are
+    lab = pd.DataFrame({"month": ["Jan", "July", "March", "May"] * 75, "time": [f"{8 + i % 10:02d}:{i % 60:02d}" for i in range(300)],
+                        "score": [f"{i % 5}-{i % 3}" for i in range(300)], "version": [f"1.{i % 9}.{i % 7}" for i in range(300)],
+                        "stamp": [f"2020-01-{1 + i % 28:02d}T10:00:00+05:30" for i in range(300)],
+                        "short": [f"{1 + i % 28:02d}.{1 + i % 12:02d}.20" for i in range(300)]})
+    got = {c["column"]: c["detected_type"] for c in detect_column_types(lab)["columns"]}
+    assert [c for c, t in got.items() if t == "datetime"] == ["stamp", "short"], got
     print(f"quality score self-check passed: clean={cs['score']} ({cs['grade']}) "
           f"dirty={ds['score']} ({ds['grade']}) because {[d['reason'] for d in ds['deductions']]}")

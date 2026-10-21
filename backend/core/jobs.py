@@ -14,7 +14,9 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from core import store
+from core import logs, store
+
+log = logs.get("jobs")
 
 DEFAULT_TIME_LIMIT_S = 3600   # spec §8: 60 min per run, our starting point
 _ACTIVE = {"queued", "running"}
@@ -58,6 +60,7 @@ def start(ds_id, fn, settings, time_limit_s):
     _update(job.dir, state="queued", created=time.time(), time_limit_s=time_limit_s, progress={})
     _cancel[run_id] = threading.Event()
     _futures[run_id] = _pool.submit(_run, job, fn)
+    log.info("run %s of %s queued (%s)", run_id, ds_id, settings.get("kind") or "job")
     return run_id
 
 
@@ -68,6 +71,7 @@ def _run(job, fn):
     else:
         job.started = time.time()
         _update(job.dir, state="running", started=job.started)
+        log.info("run %s started", job.run_id)
         try:
             fn(job)
         except Stopped as stop:
@@ -76,6 +80,9 @@ def _run(job, fn):
             traceback.print_exc()
             state, error = "failed", f"{type(exc).__name__}: {exc}"
     _update(job.dir, state=state, error=error, finished=time.time())
+    (log.warning if error else log.info)("run %s %s%s%s", job.run_id, state,
+                                         f" after {time.time() - job.started:.1f}s" if job.started else "",
+                                         f": {error}" if error else "")
     _cancel.pop(job.run_id, None)
 
 

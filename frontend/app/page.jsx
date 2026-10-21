@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import Admin from "./admin";
 import Bibliometrics from "./biblio";
@@ -61,6 +61,9 @@ function StudioApp() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [file, setFile] = useState(null);
   const [datasetName, setDatasetName] = useState("");
+  // true once the user types a name for the upload: then choosing another file keeps it;
+  // otherwise the name follows the chosen file (it kept the previous dataset's name before)
+  const nameTyped = useRef(false);
   const [taskType, setTaskType] = useState("auto");
   const [taskChoice, setTaskChoice] = useState("auto"); // the Target picker's task (auto = from the target's type)
   const [biblioId, setBiblioId] = useState(null);
@@ -79,6 +82,24 @@ function StudioApp() {
     fetch(`${API}/api/upload/limits`).then((r) => (r.ok ? r.json() : null)).then(setLimits).catch(() => {});
     setChatOpen(window.innerWidth >= CHAT_DOCK_MIN);
   }, []);
+
+  // Signing in (or a session restored on load) opens the studio. The same account coming
+  // back after an expired session keeps its place; another account starts on a clean dashboard.
+  const signedIn = useRef(false);
+  const lastAccount = useRef(null);
+  useEffect(() => {
+    if (isLoading) return;
+    if (user && !signedIn.current) {
+      if (lastAccount.current !== null && lastAccount.current !== user.id) {
+        setResult(null); setProgress({}); setTarget(""); setTaskChoice("auto"); setFile(null);
+        setDatasetName(""); nameTyped.current = false; setBiblioId(null); setError("");
+      }
+      if (lastAccount.current !== user.id) setActiveTab("dashboard");
+      lastAccount.current = user.id;
+      setViewMode("studio");
+    }
+    signedIn.current = !!user;
+  }, [user, isLoading]);
 
   // Enforce mandatory registration/login for accessing the studio
   useEffect(() => {
@@ -113,10 +134,15 @@ function StudioApp() {
       return;
     }
     setFile(f);
-    if (!datasetName) {
-      const base = f.name.replace(/\.[^/.]+$/, "");
-      setDatasetName(base.replace(/[-_]/g, " "));
+    if (!nameTyped.current || !datasetName.trim()) {
+      nameTyped.current = false;
+      setDatasetName(f.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " "));   // "nvda_stock-clean.csv" -> "nvda stock clean"
     }
+  }
+
+  function typeName(value) {
+    nameTyped.current = true;
+    setDatasetName(value);
   }
 
   async function analyze() {
@@ -130,6 +156,7 @@ function StudioApp() {
       if (datasetName.trim() && datasetName.trim() !== data.title) {
         try { data.title = (await call(`/api/projects/${data.id}`, { title: datasetName.trim() }, "PATCH")).title; } catch {}
       }
+      nameTyped.current = false;   // a typed name was for this upload; the next file names itself again
       setResult(data);
       setProgress({});
       setTarget("");
@@ -150,7 +177,6 @@ function StudioApp() {
       const data = await call(`/api/samples/${key}`, {});
       setResult(data);
       setProgress({});
-      setDatasetName(data.title);
       setTarget(data.suggested?.target || "");
       setTaskChoice(task === "classification" || task === "regression" ? "auto" : task);
       switchTab("preview");
@@ -169,7 +195,6 @@ function StudioApp() {
     try {
       const data = await call(`/api/projects/${p.id}`);
       setResult(data);
-      setDatasetName(data.title);
       setTarget(data.restore?.target || "");
       setTaskChoice(data.restore?.task || "auto");
       // a stored preprocessing means the steps before it were finished last time
@@ -188,6 +213,7 @@ function StudioApp() {
     setResult(null);
     setProgress({});
     setDatasetName("");
+    nameTyped.current = false;
     setTarget("");
     setTaskChoice("auto");
     setError("");
@@ -386,7 +412,7 @@ function StudioApp() {
               file={file}
               setFile={pick}
               datasetName={datasetName}
-              setDatasetName={setDatasetName}
+              setDatasetName={typeName}
               taskType={taskType}
               setTaskType={setTaskType}
               loading={loading}
@@ -544,6 +570,21 @@ function Report({ data, setData, tab, setTab, target, setTarget, taskChoice = "a
 
       {/* ===== INSIGHTS TAB ===== */}
       <div hidden={tab !== "insights"}>
+        {/* plan §24: warn about possible personal identifiers before anything is processed */}
+        {(checks.personal_data?.has_personal_data || checks.id_columns.has_id_columns) && (
+          <div className="privacy-note" role="note">
+            <Icon name="shield" size={18} />
+            <div>
+              <b>Possible personal identifiers</b>
+              <p>
+                {[...(checks.personal_data?.columns || []).map((p) => `${p.column} (${p.kind === "email" ? "e-mail addresses" : "phone numbers"})`),
+                  ...checks.id_columns.columns.map((c) => `${c.column} (one value per row)`)].join(", ")}.
+                {" "}Drop them on the Cleaning step unless the analysis needs them, and make sure their use is covered by consent
+                or ethics approval (you can record it on the Report step).
+              </p>
+            </div>
+          </div>
+        )}
         {/* Target: selected during Quality Audit to guide cleaning, EDA, and preprocessing */}
         <TargetPicker data={data} target={target} setTarget={setTarget} taskChoice={taskChoice} setTaskChoice={setTaskChoice} />
         {data.load_notes?.length > 0 && (
@@ -824,7 +865,8 @@ function Report({ data, setData, tab, setTab, target, setTarget, taskChoice = "a
 
       {/* ===== REPORT TAB ===== */}
       <div hidden={tab !== "report"}>
-        {tab === "report" && <ReportPanel data={data} refreshKey={prepRev + rev} onDownloaded={() => mark("report")} />}
+        {tab === "report" && <ReportPanel data={data} refreshKey={prepRev + rev} onDownloaded={() => mark("report")}
+                                          onEthics={(ethics) => setData({ ...data, ethics })} />}
         {footer("report")}
       </div>
 

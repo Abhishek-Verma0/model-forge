@@ -23,8 +23,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api import assistant, auth, biblio, data, explain, inference, projects, report, stats, training
-from api.common import SafeJSONResponse
-from core import config, database, jobs, store
+from api.common import RequestLog, SafeJSONResponse
+from core import config, database, jobs, logs, store  # noqa: F401 -- logs: console handler for the modelforge loggers
 
 # Initialize database tables (User, etc.)
 database.init_db()
@@ -36,6 +36,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLog)   # console: each request's arrival, answer + duration, and what a slow one is doing
 app.include_router(auth.router)
 app.include_router(auth.admin_router)
 app.include_router(data.public)

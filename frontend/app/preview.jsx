@@ -25,7 +25,8 @@ export default function DatasetPreview({ data, target }) {
     const preferred = classCols.find((c) =>
       /churn|target|label|outcome|class|status|default/i.test(c)
     );
-    return preferred || classCols[0] || profile?.column_names?.[0] || "";
+    // no column with 2-10 values: no donut -- an ID or free-text column is never charted by itself
+    return preferred || classCols[0] || "";
   });
 
   // Calculate distribution for selected column
@@ -244,8 +245,8 @@ export default function DatasetPreview({ data, target }) {
                 )}
               </svg>
               <div className="donut-center-info">
-                <span className="donut-center-col">{selectedCol}</span>
-                <span className="donut-center-sub">{distribution.length} Classes</span>
+                <span className="donut-center-col">{selectedCol || "—"}</span>
+                <span className="donut-center-sub">{selectedCol ? `${distribution.length} Classes` : "no column with 2–10 values"}</span>
               </div>
             </div>
 

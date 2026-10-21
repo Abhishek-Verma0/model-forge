@@ -9,6 +9,7 @@ from core import store
 from models.user import User
 
 router = APIRouter(dependencies=[Depends(owner_guard)])
+ETHICS_MAX = 2000  # our starting point: characters kept of the ethics / consent note
 
 
 @router.get("/api/projects")
@@ -34,12 +35,17 @@ def reopen(id: str):
 
 
 @router.patch("/api/projects/{id}")
-def rename(id: str, title: str = Body(..., embed=True)):
+def rename(id: str, title: str | None = Body(None), ethics: str | None = Body(None)):
+    """Rename and/or record the ethics approval / consent note (plan §24) shown in the report."""
     try:
-        store.rename(id, title)
+        if title is not None:
+            store.rename(id, title)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    return {"id": id, "title": store.meta(id)["title"]}
+    if ethics is not None:
+        store.update_meta(id, ethics=ethics.strip()[:ETHICS_MAX] or None)
+    m = store.meta(id)
+    return {"id": id, "title": m["title"], "ethics": m.get("ethics")}
 
 
 @router.delete("/api/projects/{id}")

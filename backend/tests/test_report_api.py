@@ -67,7 +67,11 @@ assert pdf.status_code == 200 and pdf.headers["content-type"] == "application/pd
 assert "attachment" in pdf.headers["content-disposition"] and pages(pdf.content) >= 6, pages(pdf.content)
 xl = openpyxl.load_workbook(io.BytesIO(me.get(f"/api/report/excel?id={ds}").content))
 assert {"Data dictionary", "Model metrics", "Parameters", "Hypothesis decisions", "Descriptives"} <= set(xl.sheetnames)
+# plan §24: the ethics / consent note is stored with the project and carried into the record
+assert me.patch(f"/api/projects/{ds}", json={"ethics": " IEC ref 41 "}).json()["ethics"] == "IEC ref 41"
+assert other.patch(f"/api/projects/{ds}", json={"ethics": "x"}).status_code == 404
 js = me.get(f"/api/report/json?id={ds}").json()
+assert js["dataset"]["ethics"] == "IEC ref 41" and me.get(f"/api/projects/{ds}").json()["ethics"] == "IEC ref 41"
 assert js["run"]["id"] == run and js["preprocessing"]["task"] == "classification" and len(js["statistics"]) == 2
 assert other.get(f"/api/report/pdf?id={ds}").status_code == 404
 

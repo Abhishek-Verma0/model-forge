@@ -49,17 +49,20 @@ def _intlike(series):
 
 
 def _parse_dates(s, dayfirst):
+    # utc=True, then the zone dropped: a timestamp with an offset ("2020-01-01T10:00:00+05:30")
+    # is read as its UTC time, a plain one is unchanged -- without it, writing offset times
+    # into the result column raised TypeError (HTTP 500 on cleaning)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        out = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
+        out = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst, utc=True)
         if out.isna().sum() > s.isna().sum():   # several formats in one column: parse each value
-            mixed = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst, format="mixed")
+            mixed = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst, format="mixed", utc=True)
             if mixed.notna().sum() > out.notna().sum():
                 out = mixed
-    return out
+    return out.dt.tz_localize(None)
 
 
-def _to_datetime(series, dayfirst=None):
+def to_datetime(series, dayfirst=None):
     """Text -> dates, deciding day/month order from the column's OWN values:
     a first number above 12 (25/12/2020) proves day-first, a second above 12 proves
     month-first. pandas alone reads every nn/nn/yyyy month-first and turns the
@@ -194,7 +197,7 @@ def apply_clean(df, ops, replay=False):
                     reading = f"commas read as {op['commas']}" if op["commas"] else None
                 df[col] = num.astype("Int64") if _intlike(num) else num
             elif to == "datetime":
-                df[col], op["dayfirst"], reading = _to_datetime(df[col], op.get("dayfirst"))
+                df[col], op["dayfirst"], reading = to_datetime(df[col], op.get("dayfirst"))
             else:  # category
                 df[col] = df[col].astype("category")
 
@@ -315,6 +318,11 @@ if __name__ == "__main__":
     assert apply_clean(pd.DataFrame({"d": ["03/04/2020"]}), [op])[0]["d"].iloc[0] == pd.Timestamp("2020-04-03")
     us = apply_clean(pd.DataFrame({"d": ["12/31/2020", "03/04/2020"]}), [{"op": "retype", "column": "d", "to": "datetime"}])
     assert us[0]["d"].tolist() == [pd.Timestamp("2020-12-31"), pd.Timestamp("2020-03-04")], us
+    # timestamps with a time zone are read as UTC (they raised TypeError); plain ones are unchanged
+    tz = apply_clean(pd.DataFrame({"t": ["2020-01-01T10:00:00Z", "2020-01-01T10:00:00+05:30", "2020-01-02 08:00"]}),
+                     [{"op": "retype", "column": "t", "to": "datetime"}])[0]["t"]
+    assert tz.tolist() == [pd.Timestamp("2020-01-01 10:00"), pd.Timestamp("2020-01-01 04:30"),
+                           pd.Timestamp("2020-01-02 08:00")], tz.tolist()
 
     # numbers: "3,5" is three and a half (was 35), "1,200" is twelve hundred
     nop = {"op": "retype", "column": "x", "to": "number"}

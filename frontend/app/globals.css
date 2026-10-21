@@ -678,6 +678,17 @@ td select {
   padding: 5px 8px;
   font-size: 12.5px;
 }
+/* Name and box sit side by side; when both don't fit the field's width, the box goes under its
+   name instead of running over the next field. A number box without a max attribute is 140px by
+   default -- wider than most capped fields: measured 2026-10-21, 10 of 36 capped fields spilled
+   past their width and 7 covered the next one (Train "Time limit" over "Validation share"). */
+.pp-field { flex-wrap: wrap; }
+.pp-field input,
+.pp-field select { max-width: 100%; }
+@media (min-width: 769px) {   /* phones keep full-width boxes (the max-width: 768px block below) */
+  .builder-row .pp-field input[type="number"],
+  .pp-card .pp-field input[type="number"] { width: 6em; }
+}
 .pp-reason { margin: 2px 0 0; font-size: 12px; color: var(--muted); line-height: 1.55; }
 
 /* Numbered step rail (detected / AI recommends) */
@@ -4548,3 +4559,18 @@ td select {
     transition-duration: 0.01ms !important; scroll-behavior: auto !important;
   }
 }
+
+/* plan §24: personal-data warning (audit) and the ethics / consent note (report) */
+.privacy-note {
+  display: flex; gap: 12px; align-items: flex-start; margin: 0 0 16px; padding: 14px 16px;
+  border: 1px solid #F3D9A4; border-radius: var(--r-md); background: var(--warn-bg); color: var(--warn);
+}
+.privacy-note b { color: var(--text); }
+.privacy-note p { margin: 4px 0 0; color: var(--text); font-size: 14px; line-height: 1.5; }
+.ethics-panel { margin-top: 16px; padding: 16px; overflow: visible; }
+.ethics-panel textarea {
+  display: block; width: 100%; margin-top: 8px; padding: 10px 12px; resize: vertical;
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--panel);
+  color: var(--text); font: 14px/1.5 var(--font-sans);
+}
+.ethics-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }

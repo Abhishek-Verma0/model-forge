@@ -121,6 +121,10 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip()
 # 0 = keep until the owner deletes it (plan §24: deletion + a retention period).
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 0))
 
+# Console logging (core/logs.py): INFO shows each request and the steps inside it,
+# DEBUG adds the polling requests, WARNING keeps only slow and failing ones.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
 
 def dataset_path():
     """The dataset to work on: CLI argument first, then $DATASET_PATH."""

@@ -39,8 +39,11 @@ assert upload(alice, "empty.csv", "").status_code == 422
 assert upload(alice, "bad.json", "{not json").status_code == 422
 
 # alice's dataset is invisible to bob through every way of naming it
-ds = upload(alice, "data.csv", "x,y\n" + "".join(f"{i},{'ab'[i % 2]}\n" for i in range(40))).json()["id"]
+up = upload(alice, "data.csv", "x,y\n" + "".join(f"{i},{'ab'[i % 2]}\n" for i in range(40))).json()
+ds = up["id"]
+assert up["charts"]["builder"]["x"]["bar"] == ["x", "y"], up["charts"]["builder"]   # the builder's choices travel with the data
 assert alice.get(f"/api/chart?id={ds}&kind=histogram&x=x").status_code == 200
+assert alice.get(f"/api/chart?id={ds}&kind=density&x=y").status_code == 422   # a category has no density: refused, not drawn
 assert bob.get(f"/api/chart?id={ds}&kind=histogram&x=x").status_code == 404                  # query
 assert bob.post("/api/clean", json={"id": ds, "ops": []}).status_code == 404                  # JSON body
 assert bob.post("/api/predict", data={"id": ds, "run": "x"},

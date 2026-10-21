@@ -27,12 +27,7 @@ export default function DatasetUpload({
 
   function handleFileSelect(selectedFile) {
     if (!selectedFile) return;
-    setFile(selectedFile);
-    if (!datasetName) {
-      // derive clean name from filename (remove extension)
-      const baseName = selectedFile.name.replace(/\.[^/.]+$/, "");
-      setDatasetName(baseName.replace(/[-_]/g, " "));
-    }
+    setFile(selectedFile);   // names the dataset after the file unless one was typed (page.jsx pick)
   }
 
   async function loadSampleDataset(sample) {

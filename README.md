@@ -10,11 +10,13 @@ analyses publication exports from Scopus, Web of Science, PubMed and similar dat
 ## What it does
 
 - **Accounts and projects** — email / password or Google sign-in, password reset by email,
-  administrator role. Every upload is a private project: only its owner can open it; projects can be
+  administrator role, and a dashboard of projects, latest results and reports. Every upload is a private project: only its owner can open it; projects can be
   reopened, renamed and deleted (with everything made from them), and a retention period can be set.
+- **Guided pipeline** — a numbered step track in the sidebar; each step's Next appears once the step is done.
 - **Upload and audit** — CSV, TSV, JSON or Excel upload (delimiter, encoding and decimal commas
   detected; infinite values treated as missing) with a data profile, quality score and warnings
-  (missing values, duplicates, outliers, ID-like, constant and high-cardinality columns). Sample
+  (missing values, duplicates, outliers, ID-like, constant and high-cardinality columns) and a warning
+  for columns of e-mail addresses or phone numbers. Sample
   datasets bundled with scikit-learn load in one click.
 - **Clean** — fix whitespace, spellings, types (day/month order and decimal commas decided from the
   column's own values), placeholders, zeros that mean "not measured", duplicates; questionnaire
@@ -41,7 +43,7 @@ analyses publication exports from Scopus, Web of Science, PubMed and similar dat
   institutions, citations, h / g / i10 / m indices, co-authorship, country, keyword, co-citation and
   coupling networks, thematic map and evolution, three-field plot, word cloud, trending topics.
 - **Report** — a PDF report of the whole project (or of a publication collection), Excel tables
-  and a JSON experiment record.
+  and a JSON experiment record; an ethics approval / consent note can be recorded and is printed in it.
 - **Test and save** — predict on a typed-in row or an uploaded file, browse the test set, save
   trained models.
 - **AI assistant (optional)** — suggests cleaning, preprocessing and models, checks whether the

@@ -49,6 +49,12 @@ function gatherFlags(report) {
       if (k === "zero_values") add(c.column, `${c.issues[k].toLocaleString()} zero(s)`, {});
     }
   }
+  // dates stored as text: named, never pre-ticked -- the user chooses "Change type: datetime" (charts read them as
+  // dates either way); a pre-ticked conversion would fail the whole cleaning run on a column it can't read
+  for (const c of checks.column_types.columns) {
+    if (c.detected_type === "datetime" && !String(c.pandas_dtype).startsWith("datetime"))
+      add(c.column, "dates stored as text (Change type: datetime reads them as dates)", {});
+  }
   for (const c of checks.constant_columns.columns) add(c.column, "constant", { drop: true });
   for (const c of checks.id_columns.columns) add(c.column, "ID-like", { drop: true });
   for (const c of checks.high_cardinality.columns) add(c.column, "many values (text-encoded in Preprocessing)", {});

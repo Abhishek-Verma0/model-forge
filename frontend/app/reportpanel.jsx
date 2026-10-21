@@ -8,12 +8,14 @@ import Icon from "./icons";
 
 const DONE = ["train", "tune", "cluster"];
 
-export default function ReportPanel({ data, refreshKey, onDownloaded }) {
+export default function ReportPanel({ data, refreshKey, onDownloaded, onEthics }) {
   const [runs, setRuns] = useState([]);
   const [run, setRun] = useState("");
   const [stats, setStats] = useState(0);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
+  const [ethics, setEthics] = useState(data.ethics || "");
+  const [saved, setSaved] = useState("");
 
   useEffect(() => {
     call(`/api/runs/summary?id=${data.id}`)
@@ -26,6 +28,14 @@ export default function ReportPanel({ data, refreshKey, onDownloaded }) {
     setBusy(kind); setErr("");
     try { await download(`/api/report/${kind}?id=${data.id}${run ? `&run=${run}` : ""}`, name); onDownloaded?.(); }
     catch (e) { setErr(e.message); } finally { setBusy(""); }
+  }
+
+  async function saveEthics() {
+    setErr(""); setSaved("");
+    try {
+      const r = await call(`/api/projects/${data.id}`, { ethics }, "PATCH");
+      onEthics?.(r.ethics); setSaved(r.ethics ? "Saved. It appears in the PDF report." : "Cleared.");
+    } catch (e) { setErr(e.message); }
   }
 
   const chosen = runs.find((r) => r.run_id === run) || runs[0];
@@ -70,6 +80,19 @@ export default function ReportPanel({ data, refreshKey, onDownloaded }) {
           fitted preprocessing pipeline download from the Train and Preprocessing tabs.
         </p>
         {err && <div className="error" style={{ marginTop: 8 }}>{err}</div>}
+      </div>
+
+      <div className="panel ethics-panel">
+        <label htmlFor="ethics-note"><b>Ethics approval and consent</b> (plan §24, optional)</label>
+        <p className="note" style={{ marginTop: 2 }}>For data about people: the approving committee and reference number, and how
+          consent was obtained. It is printed in the report&apos;s dataset description.</p>
+        <textarea id="ethics-note" rows={3} maxLength={2000} value={ethics}
+                  onChange={(e) => { setEthics(e.target.value); setSaved(""); }}
+                  placeholder="e.g. Approved by the Institutional Ethics Committee, ref. IEC/2026/041; written informed consent from all participants." />
+        <div className="ethics-actions">
+          <button type="button" className="btn btn-secondary btn-sm" disabled={ethics === (data.ethics || "")} onClick={saveEthics}>Save</button>
+          {saved && <span className="note" role="status" style={{ margin: 0 }}>{saved}</span>}
+        </div>
       </div>
     </section>
   );
