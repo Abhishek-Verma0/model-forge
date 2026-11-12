@@ -11,7 +11,7 @@ from core import store
 from models.user import User
 
 router = APIRouter(dependencies=[Depends(owner_guard)])  # signed in + owns the collection
-ALLOWED = {".csv", ".txt", ".tsv", ".nbib"}   # Scopus CSV; WoS / PubMed text exports
+ALLOWED = {".csv", ".txt", ".tsv", ".nbib", ".json"}   # Scopus / Dimensions CSV; WoS / PubMed text; Crossref / OpenAlex JSON
 
 
 def _records(ds_id):

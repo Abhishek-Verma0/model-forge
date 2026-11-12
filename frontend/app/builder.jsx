@@ -5,7 +5,8 @@ import { useEffect, useState } from "react";
 import { blobUrl, download } from "./apiclient";
 const NEEDS_Y = ["scatter", "line"];   // plotted against a second column
 const NO_HUE = ["pie", "length", "words"]; // one column only
-const LABEL = { length: "text length", words: "common words", tsne: "t-SNE map" };
+const NO_X = ["tsne", "umap"];   // maps of all number columns: no column to pick
+const LABEL = { length: "text length", words: "common words", tsne: "t-SNE map", umap: "UMAP map" };
 
 // User-driven charts: pick a type + column(s) + optional color/group, and the
 // backend renders that exact chart (matplotlib/seaborn) as a PNG we <img>.
@@ -14,7 +15,7 @@ const LABEL = { length: "text length", words: "common words", tsne: "t-SNE map" 
 // one bar per value (that took 152 s on 12,000 ids, measured 2026-10-21).
 export default function ChartBuilder({ data }) {
   const fits = data.charts?.builder || { x: {}, y: [], hue: [] };
-  const kinds = Object.keys(fits.x).filter((k) => (k === "tsne" ? fits.y.length >= 2
+  const kinds = Object.keys(fits.x).filter((k) => (NO_X.includes(k) ? fits.y.length >= 2
     : fits.x[k].length > 0 && (!NEEDS_Y.includes(k) || fits.y.length > 0)));
   const id = data.id;
   const [kind, setKind] = useState("");
@@ -30,10 +31,10 @@ export default function ChartBuilder({ data }) {
   const xv = xs.includes(x) ? x : xs[0] || "";
   const yv = fits.y.includes(y) ? y : fits.y.find((c) => c !== xv) || fits.y[0] || "";
   const hv = !NO_HUE.includes(k) && fits.hue.includes(hue) ? hue : "";
-  const ready = !!k && (k === "tsne" || !!xv) && (!NEEDS_Y.includes(k) || !!yv);
+  const ready = !!k && (NO_X.includes(k) || !!xv) && (!NEEDS_Y.includes(k) || !!yv);
 
   const params = new URLSearchParams({ id, kind: k });
-  if (k !== "tsne") params.set("x", xv);
+  if (!NO_X.includes(k)) params.set("x", xv);
   if (NEEDS_Y.includes(k)) params.set("y", yv);
   if (hv) params.set("hue", hv);
   const query = params.toString();
@@ -51,7 +52,7 @@ export default function ChartBuilder({ data }) {
   if (!id) return null;
 
   function save(fmt) {
-    download(`/api/chart?${query}&fmt=${fmt}`, `chart_${k}_${xv || "map"}.${fmt}`).catch((e) => setErr(e.message));
+    download(`/api/chart?${query}&fmt=${fmt}&download=true`, `chart_${k}_${xv || "map"}.${fmt}`).catch((e) => setErr(e.message));
   }
 
   return (
@@ -72,7 +73,7 @@ export default function ChartBuilder({ data }) {
                   ))}
                 </select>
               </Field>
-              {k !== "tsne" && (
+              {!NO_X.includes(k) && (
                 <Field label="X axis">
                   <select value={xv} onChange={(e) => setX(e.target.value)}>
                     {xs.map((c) => (

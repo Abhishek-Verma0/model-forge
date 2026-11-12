@@ -65,13 +65,36 @@ def load_sample(name: str, user: User = Depends(owner_guard)):
 
 
 @router.get("/api/chart")
-def chart(id: str, kind: str, x: str = "", y: str = "", hue: str = "", fmt: str = "png"):
+def chart(id: str, kind: str, x: str = "", y: str = "", hue: str = "", fmt: str = "png", download: bool = False):
+    """download=true: PNG at print resolution (the on-screen copy stays small)."""
     df = frame_or_404(id)
     try:
-        img, media = plot.render(df, kind, x=x or None, y=y or None, hue=hue or None, fmt=fmt)
+        img, media = plot.render(df, kind, x=x or None, y=y or None, hue=hue or None, fmt=fmt,
+                                 dpi=plot.DOWNLOAD_DPI if download else plot.SCREEN_DPI)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     return Response(content=img, media_type=media)
+
+
+@router.get("/api/eda/chart")
+def eda_chart(id: str, key: str, fmt: str = "png"):
+    """One automatic EDA chart drawn again for download: PNG at print resolution or SVG."""
+    from eda.eda import render_one
+    try:
+        img, media, title = render_one(frame_or_404(id), key, fmt)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    # headers are latin-1: a title in another script ("收入") must not become a 500 (the page names the file itself)
+    name = "".join(ch if ch.isascii() and ch.isalnum() else "_" for ch in title).strip("_") or "chart"
+    return Response(content=img, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{name}.{fmt}"'})
+
+
+@router.get("/api/duplicates")
+def duplicates(id: str):
+    """The duplicated rows of the current table, grouped (preview before removing them)."""
+    from preprocessing.detector import duplicate_groups
+    return duplicate_groups(frame_or_404(id))
 
 
 @router.post("/api/clean")

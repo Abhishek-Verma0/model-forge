@@ -47,16 +47,40 @@ def _dir(ds_id):
     return ROOT / _check(ds_id)
 
 
+# Windows refuses to replace a file another thread has open (and to open one being
+# replaced) with PermissionError; the clash lasts microseconds. Measured 2026-10-31: a
+# writer every 10 ms + 2 readers every 5 ms failed 12-24 of ~430 writes, 4-7 of ~1780
+# reads. Retrying is the standard answer; elsewhere the first try succeeds.
+SHARE_RETRIES = 40        # our starting point: x SHARE_WAIT_S = 2 s worst case
+SHARE_WAIT_S = 0.05
+
+
+def _retry(fn):
+    for attempt in range(SHARE_RETRIES):
+        try:
+            return fn()
+        except PermissionError:
+            if attempt == SHARE_RETRIES - 1:
+                raise
+            time.sleep(SHARE_WAIT_S)
+
+
 def write_json(path, obj):
     path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # one temp file per thread: two writers of the same file never share a temp file
+    tmp = path.with_suffix(f"{path.suffix}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(obj, default=str), encoding="utf-8")
-    tmp.replace(path)  # atomic: a crash never leaves half a file
+    _retry(lambda: tmp.replace(path))  # atomic: a crash never leaves half a file
 
 
 def read_json(path):
     path = Path(path)
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    if not path.exists():
+        return None
+    try:
+        return json.loads(_retry(lambda: path.read_text(encoding="utf-8")))
+    except FileNotFoundError:   # deleted between the check and the read
+        return None
 
 
 def _remember(ds_id, df):
@@ -332,6 +356,25 @@ if __name__ == "__main__":
     write_json(run_dir(ds, run) / "status.json", {"state": "done"})
     assert run_ids(ds) == [run] and read_json(run_dir(ds, run) / "status.json") == {"state": "done"}
     assert all_run_dirs() == [run_dir(ds, run)]
+    # a status file polled while it is rewritten: no reader or writer may fail (Windows sharing clash)
+    status, errors, stop = run_dir(ds, run) / "status.json", [], time.time() + 1.5
+
+    def hammer(fn):
+        while time.time() < stop:
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 -- collected and asserted below
+                errors.append(repr(exc))
+
+    workers = [threading.Thread(target=hammer, args=(lambda: write_json(status, {"state": "running", "n": 1}),)),
+               *[threading.Thread(target=hammer, args=(lambda: read_json(status),)) for _ in range(2)]]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert not errors, errors[:3]
+    assert read_json(status) == {"state": "running", "n": 1}
+    write_json(status, {"state": "done"})
     try:
         run_dir(ds, "../x")
         raise AssertionError("bad run id accepted")

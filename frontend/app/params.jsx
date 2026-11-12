@@ -35,8 +35,7 @@ export default function ParamsForm({ model, values, onChange, disabled }) {
   return (
     <div>
       {model.params.map((p) => (
-        <div key={p.name} style={{ display: "grid", gridTemplateColumns: "minmax(160px, 220px) 140px 1fr", gap: 10,
-                                   alignItems: "center", padding: "6px 0", borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+        <div key={p.name} className="pf-row">
           <span>{p.label}{range(p) && <span className="note"> ({range(p)})</span>}</span>
           <span>{input(p)}</span>
           <span className="note">{p.help} <span style={{ whiteSpace: "nowrap" }}>Default: {shown(p.default)}.</span></span>

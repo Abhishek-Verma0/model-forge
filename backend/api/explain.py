@@ -24,6 +24,21 @@ def start(payload: dict = Body(...)):
                               {"kind": "explain", "run": run, "model": key}, jobs.DEFAULT_TIME_LIMIT_S)}
 
 
+@router.post("/api/explain/row")
+def row(payload: dict = Body(...)):
+    """Body: {id, run, model, row} -> one locked test row's prediction explained (SHAP where
+    the model type has it, LIME always). row is 0-based."""
+    from explain import local
+    try:
+        return local.explain_row(payload.get("id"), payload.get("run"), payload.get("model"), payload.get("row"))
+    except KeyError:                       # a malformed id / run never becomes a path
+        raise HTTPException(404, "Run not found.") from None
+    except LookupError as exc:             # (KeyError is a LookupError: caught above first)
+        raise HTTPException(404, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
 @router.get("/api/explain")
 def read(id: str, run: str, model: str):
     try:

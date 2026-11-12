@@ -1,10 +1,11 @@
 """Ensembles (plan §9.5; spec 2026-09-13 §7 piece 5): voting (hard / soft),
-stacking with a meta-model, and weighted averaging -- built from models of the
-table, each with the parameters the user set for it. An ensemble is one more row
+stacking with a meta-model, weighted averaging and bagging -- built from models of
+the table, each with the parameters the user set for it. An ensemble is one more row
 of the run: same preprocessing (fitted once per fold, shared by its members), same
-folds, same locked test set, same metrics. Bagging and boosting are already rows
-of the table (random forest / extra trees; AdaBoost, gradient boosting, XGBoost,
-LightGBM, CatBoost).
+folds, same locked test set, same metrics. Bagging takes ONE model and trains copies
+of it on bootstrap resamples of the rows (scikit-learn BaggingClassifier /
+BaggingRegressor); boosting is already rows of the table (AdaBoost, gradient
+boosting, XGBoost, LightGBM, CatBoost), as are bagged trees (random forest, extra trees).
 
 Only valid combinations are offered (plan §9.6 "tested pipelines"):
   - soft voting / weighted averaging of classifiers need every member to give
@@ -21,11 +22,14 @@ from sklearn import ensemble as E
 KINDS = {
     "classification": {"voting_hard": "Voting (hard - majority of predicted classes)",
                        "voting_soft": "Voting (soft - average of probabilities, optionally weighted)",
-                       "stacking": "Stacking (logistic regression on the members' predictions)"},
+                       "stacking": "Stacking (logistic regression on the members' predictions)",
+                       "bagging": "Bagging (one model trained on bootstrap resamples of the rows, votes combined)"},
     "regression": {"averaging": "Weighted averaging (mean of predictions, optionally weighted)",
-                   "stacking": "Stacking (ridge regression on the members' predictions)"},
+                   "stacking": "Stacking (ridge regression on the members' predictions)",
+                   "bagging": "Bagging (one model trained on bootstrap resamples of the rows, predictions averaged)"},
 }
 MIN_MEMBERS = 2
+BAG_COPIES = 10   # published default: scikit-learn BaggingClassifier / BaggingRegressor n_estimators=10
 
 
 def _has_proba(row):
@@ -43,11 +47,16 @@ def validate(task, specs, rows, compatible, grouped):
             raise ValueError(f"Only one {kind.replace('_', ' ')} ensemble per run.")
         seen.add(kind)
         members = list(dict.fromkeys(spec.get("members") or []))
-        if len(members) < MIN_MEMBERS:
+        if kind == "bagging" and len(members) != 1:
+            raise ValueError("Bagging: choose exactly one model to train copies of.")
+        if kind != "bagging" and len(members) < MIN_MEMBERS:
             raise ValueError(f"{KINDS[task][kind]}: choose at least {MIN_MEMBERS} models.")
         for m in members:
             if m not in rows or m == "baseline":
                 raise ValueError(f"'{m}' can't be an ensemble member.")
+            if rows[m].get("pipeline"):   # its step lives in the row's own pipeline, not in the model
+                raise ValueError(f"{rows[m]['label']} is a tested pipeline - its preprocessing step can't run inside "
+                                 f"an ensemble. Use {rows[rows[m]['base']]['label']} as the member instead.")
             if not compatible.get(m, False):
                 raise ValueError(f"{rows[m]['label']} can't train on this data, so it can't join an ensemble.")
             if kind in ("voting_soft",) and not _has_proba(rows[m]):
@@ -63,8 +72,9 @@ def validate(task, specs, rows, compatible, grouped):
                 raise ValueError("Weights: one non-negative number per member, not all zero.")
             if all(w == 1 for w in weights):
                 weights = None                      # equal weights = plain voting / averaging
-            elif kind == "stacking":
-                raise ValueError("Stacking learns its own weights - leave them at 1.")
+            elif kind in ("stacking", "bagging"):
+                raise ValueError(f"{'Stacking learns its own' if kind == 'stacking' else 'Bagging has no'} "
+                                 "weights - leave them at 1.")
         out.append({"key": kind, "kind": kind, "members": members, "weights": weights})
     return out
 
@@ -82,13 +92,17 @@ def row(task, spec, rows, member_kwargs):
             return E.VotingClassifier(est, voting="soft", weights=w)
         if kind == "averaging":
             return E.VotingRegressor(est, weights=w)
+        if kind == "bagging":
+            return (E.BaggingClassifier if task == "classification" else E.BaggingRegressor)(
+                est[0][1], n_estimators=BAG_COPIES, random_state=seed)
         # stacking: scikit-learn's defaults -- LogisticRegression / RidgeCV meta-model on 5-fold
         # out-of-fold member predictions (so every fit costs members x 6)
         return (E.StackingClassifier if task == "classification" else E.StackingRegressor)(est)
 
     member_rows = [rows[m] for m in members]
     # class weights reach each member that supports them, as nested parameters (lr__class_weight=...)
-    balanced = {f"{m}__{k}": v for m in members for k, v in (rows[m]["balanced"] or {}).items()}
+    prefix = (lambda m: "estimator") if spec["kind"] == "bagging" else (lambda m: m)
+    balanced = {f"{prefix(m)}__{k}": v for m in members for k, v in (rows[m]["balanced"] or {}).items()}
     names = ", ".join(rows[m]["label"] for m in members)
     weights = f" (weights {', '.join(f'{w:g}' for w in spec['weights'])})" if spec["weights"] else ""
     return {"label": f"{KINDS[task][spec['kind']].split(' (')[0]}: {names}{weights}", "family": "Ensemble",
@@ -98,8 +112,11 @@ def row(task, spec, rows, member_kwargs):
             "params": [], "epochs": None, "resolve": None,
             "device": "gpu" if any(r["device"] == "gpu" for r in member_rows) else "cpu",
             "about": {"what": KINDS[task][spec["kind"]], "how": f"Members: {names}.",
-                      "good": "Combining different kinds of models often beats each one alone.",
-                      "watch": "Costs the members' training time combined (stacking: x6)."}}
+                      "good": ("Averaging copies trained on resampled rows steadies a model that changes a lot "
+                               "with its training rows (deep trees, k-NN)." if spec["kind"] == "bagging" else
+                               "Combining different kinds of models often beats each one alone."),
+                      "watch": (f"Costs {BAG_COPIES} fits of the model." if spec["kind"] == "bagging" else
+                                "Costs the members' training time combined (stacking: x6).")}}
 
 
 if __name__ == "__main__":
@@ -144,13 +161,25 @@ if __name__ == "__main__":
         rec = res["models"][key]
         assert "error" not in rec and rec["family"] == "Ensemble" and rec["test"]["accuracy"] > 0.7, (key, rec)
     assert "roc_auc" not in res["models"]["voting_hard"]["cv"]         # no probabilities -> no AUC, no crash
+    bag = ran(ds, {"models": ["decision_tree"], "primary_metric": "accuracy",
+                   "ensembles": [{"kind": "bagging", "members": ["decision_tree"]}]})["models"]
+    assert "error" not in bag["bagging"] and bag["bagging"]["label"] == "Bagging: Decision tree", bag["bagging"]
+    # run ids are random, not in time order: find the run that saved the bagging model
+    folder = next(store.run_dir(ds, r) / "models" for r in store.run_ids(ds)
+                  if (store.run_dir(ds, r) / "models" / "bagging.joblib").exists())
+    import joblib as _jl
+    fitted_bag = _jl.load(folder / "bagging.joblib").named_steps["model"]
+    assert len(fitted_bag.estimators_) == BAG_COPIES and fitted_bag.random_state == train.load_context(ds)["seed"]
     assert "roc_auc" in res["models"]["voting_soft"]["cv"] and "weights 2, 1, 1" in res["models"]["voting_soft"]["label"]
 
     # only valid combinations
     for bad, msg in (({"kind": "voting_soft", "members": ["logistic_regression", "svm"]}, "probabilities"),
                      ({"kind": "voting_hard", "members": ["logistic_regression"]}, "at least 2"),
                      ({"kind": "stacking", "members": ["logistic_regression", "knn"], "weights": [2, 1]}, "own weights"),
-                     ({"kind": "averaging", "members": ["logistic_regression", "knn"]}, "kind must be")):
+                     ({"kind": "averaging", "members": ["logistic_regression", "knn"]}, "kind must be"),
+                     ({"kind": "bagging", "members": ["logistic_regression", "knn"]}, "exactly one"),
+                     ({"kind": "bagging", "members": ["knn"], "weights": [2]}, "no weights"),
+                     ({"kind": "voting_hard", "members": ["smote_random_forest", "knn"]}, "tested pipeline")):
         try:
             train.validate(ds, {"models": [], "ensembles": [bad]})
             raise AssertionError(bad)

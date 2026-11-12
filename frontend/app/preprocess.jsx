@@ -80,6 +80,8 @@ function toOps(opts, step, numeric) {
       ops.push(op);
     }
     if (step.scale !== "none") ops.push({ op: "scale", method: step.scale });
+  } else if (step.encode === "ordinal" && step.order?.length) {
+    ops.push({ op: "encode", method: "ordinal", order: step.order });
   } else if (step.encode === "onehot" || step.encode === "ordinal") {
     ops.push({ op: "encode", method: step.encode });
   } else if (step.encode === "text") {
@@ -102,9 +104,21 @@ function stepFromOps(ops, numeric) {
         if (o[p.key] != null) step.params = { ...step.params, [step.outliers]: { ...step.params?.[step.outliers], [p.key]: o[p.key] } };
       }
     }
-    else if (o.op === "encode") step.encode = o.method || "onehot";
+    else if (o.op === "encode") {
+      step.encode = o.method || "onehot";
+      if (o.order?.length) step.order = o.order;
+    }
   }
   return step;
+}
+
+// Every category of a column, when the profile lists them all (top_values holds up to
+// 10) -- only then can the user put them in order for ordinal encoding.
+function levels(info, col) {
+  const c = info[col];
+  const top = (c?.top_values || []).map((t) => t.value);
+  if (!top.length || c.unique_values > top.length) return null;
+  return top.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
 // The actual pandas each op runs as -- shown so the user sees exactly what
@@ -129,7 +143,9 @@ function opCode(opts, step, numeric, col) {
     if (sc) lines.push(`${c} = ${sc}().fit(train[["${col}"]]).transform(...)`);
   } else {
     if (step.encode === "onehot") lines.push(`pd.get_dummies(${c}, prefix="${col}")  # fit categories on train`);
-    if (step.encode === "ordinal") lines.push(`${c} = ${c}.map(train_category_codes)`);
+    if (step.encode === "ordinal") lines.push(step.order?.length
+      ? `${c} = ${c}.map({${step.order.map((v, i) => `"${v}": ${i}`).join(", ")}})  # your order`
+      : `${c} = ${c}.map(train_category_codes)  # order of first appearance`);
     if (step.encode === "text") lines.push(
       `# ${col} stays as text in the CSV`,
       `TfidfVectorizer(words 1-2).fit(train["${col}"]) + TfidfVectorizer(letters 3-5).fit(...)  # train only, saved in pipeline`);
@@ -154,7 +170,9 @@ function ruleNote(opts, step, numeric) {
     const s = { robust: "scaled by median/IQR (outlier-safe)", standard: "standardized", minmax: "squeezed to 0–1" }[step.scale];
     if (s) bits.push(s);
   } else {
-    const e = { onehot: "one column per category", ordinal: "mapped to ordered numbers",
+    const e = { onehot: "one column per category",
+      ordinal: step.order?.length ? `mapped to numbers in your order (${step.order.join(" < ")})`
+        : "mapped to numbers in order of first appearance",
       text: "kept as text; its word and letter patterns are learned on train and saved in the pipeline for training" }[step.encode];
     if (e) bits.push(e);
   }
@@ -189,7 +207,8 @@ export function recommendedPlan(data, target, task) {
 
 const sameStep = (a, b) =>
   a.missing === b.missing && a.scale === b.scale && a.outliers === b.outliers && a.encode === b.encode &&
-  JSON.stringify(a.params || {}) === JSON.stringify(b.params || {});
+  JSON.stringify(a.params || {}) === JSON.stringify(b.params || {}) &&
+  JSON.stringify(a.order || []) === JSON.stringify(b.order || []);
 
 // AI's dataset-level pipeline -> our flat control state (missing sections = "none").
 function pipelineFromAI(opts, p) {
@@ -256,6 +275,14 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
   function setParam(col, method, key, value) {
     setSteps((s) => ({ ...s, [col]: { ...s[col],
       params: { ...s[col].params, [method]: { ...s[col].params?.[method], [key]: value } } } }));
+  }
+
+  function moveLevel(col, i, by) {
+    setSteps((s) => {
+      const order = [...s[col].order];
+      [order[i], order[i + by]] = [order[i + by], order[i]];
+      return { ...s, [col]: { ...s[col], order } };
+    });
   }
 
   function setStep(col, field, value) {
@@ -526,10 +553,37 @@ export default function Preprocess({ data, target, task, plan, aiPipeline, planL
                 <>
                   <label className="pp-field">
                     <span>Encode</span>
-                    <select value={step.encode} onChange={(e) => setStep(col, "encode", e.target.value)}>
+                    <select value={step.encode} onChange={(e) => {
+                      const v = e.target.value;
+                      // ordinal starts from a sorted list the user then puts in order (lowest first)
+                      setSteps((s) => ({ ...s, [col]: { ...s[col], encode: v,
+                        order: v === "ordinal" ? (s[col].order || levels(info, col) || undefined) : undefined } }));
+                    }}>
                       {opts.encode.map((o) => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </label>
+                  {step.encode === "ordinal" && (step.order?.length ? (
+                    <div className="pp-order">
+                      <span>Order, lowest first</span>
+                      <ol>
+                        {step.order.map((v, i) => (
+                          <li key={v}>
+                            <span className="pp-order-name" title={v}>{v}</span>
+                            <button type="button" className="ghost" disabled={i === 0} aria-label={`Move ${v} up`}
+                                    onClick={() => moveLevel(col, i, -1)}>↑</button>
+                            <button type="button" className="ghost" disabled={i === step.order.length - 1}
+                                    aria-label={`Move ${v} down`} onClick={() => moveLevel(col, i, 1)}>↓</button>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  ) : levels(info, col) ? (
+                    <button type="button" className="ghost" onClick={() => setStep(col, "order", levels(info, col))}>
+                      Set the category order
+                    </button>
+                  ) : (
+                    <p className="pp-reason">More than 10 categories — numbers follow the order each value first appears.</p>
+                  ))}
                 </>
               )}
 

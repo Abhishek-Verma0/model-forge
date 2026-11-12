@@ -42,6 +42,8 @@ TOP_WORDS = 20       # our starting point: words in a "common words" chart
 LABEL_ANGLE = 45     # our starting point: x names that don't fit side by side are turned this far
 LABEL_GAP = 1.2      # our starting point: turned names keep 20% of a text line clear of the next
 MAX_WIDTH_IN = 20    # our starting point: the widest a chart grows (inches) so its names fit
+SCREEN_DPI = 90      # our starting point: the on-screen copy
+DOWNLOAD_DPI = 300   # published: the print resolution journal artwork guidelines commonly ask of figures
 log = logs.get("chart")
 
 # For box/violin the user's chosen column is the numeric distribution (seaborn y)
@@ -58,19 +60,20 @@ _KINDS = {
     "length":    lambda df, x, y, hue, ax: _length(df, x, ax),
     "words":     lambda df, x, y, hue, ax: _words(df, x, ax),
     "tsne":      lambda df, x, y, hue, ax: _tsne(df, hue, ax),  # 2-D map of all numeric cols
+    "umap":      lambda df, x, y, hue, ax: _umap(df, hue, ax),  # 2-D map of all numeric cols (umap-learn)
 }
 KINDS = list(_KINDS)
 _MEDIA = {"png": "image/png", "svg": "image/svg+xml"}
-_NO_X = {"tsne"}     # kinds that use the whole numeric matrix, not a chosen column
+_NO_X = {"tsne", "umap"}  # kinds that use the whole numeric matrix, not a chosen column
 _NEEDS_Y = {"scatter", "line"}  # kinds plotting one column against another
 _NO_HUE = {"pie", "length", "words"}  # kinds that draw one column only
-_SAMPLED = {"scatter", "density", "line", "length", "words"}
+_SAMPLED = {"scatter", "density", "line", "length", "words", "umap"}
 
 # What each chart can show, by column role (see the module docstring).
 _NUM = {"number", "coded"}
 FITS = {"histogram": _NUM | {"date", "category"}, "density": _NUM, "box": _NUM, "violin": _NUM,
         "scatter": _NUM | {"date"}, "line": _NUM | {"date"}, "bar": {"coded", "category", "text"},
-        "pie": {"coded", "category"}, "length": {"free_text"}, "words": {"free_text"}, "tsne": set()}
+        "pie": {"coded", "category"}, "length": {"free_text"}, "words": {"free_text"}, "tsne": set(), "umap": set()}
 Y_FITS, HUE_FITS = _NUM, {"coded", "category"}
 _ROLE = {"datetime": "date", "boolean": "category", "categorical": "category"}
 _SAYS = {"number": "a number column with many different values", "coded": "a number column",
@@ -180,7 +183,32 @@ def _tsne(df, hue, ax):
     ax.set_xlabel("t-SNE 1"); ax.set_ylabel("t-SNE 2")
 
 
-def render(df, kind, x=None, y=None, hue=None, fmt="png"):
+UMAP_NEIGHBORS = 15    # published default: umap-learn UMAP n_neighbors=15
+UMAP_MIN_DIST = 0.1    # published default: umap-learn UMAP min_dist=0.1
+
+
+def _umap(df, hue, ax):
+    """2-D UMAP of all numeric columns (standardised first, as umap-learn's own guide
+    does), optionally colored by `hue`. For visualization only, like t-SNE."""
+    try:
+        import umap
+    except ImportError:
+        raise ValueError("The UMAP map needs the umap-learn package: run "
+                         "`python -m pip install umap-learn` in the backend environment, then restart it.") from None
+    from sklearn.preprocessing import StandardScaler
+    num = df.select_dtypes("number").dropna()
+    if num.shape[1] < 2:
+        raise ValueError("UMAP needs at least 2 numeric columns.")
+    if len(num) <= UMAP_NEIGHBORS:
+        raise ValueError(f"UMAP needs more than {UMAP_NEIGHBORS} complete rows.")
+    emb = umap.UMAP(n_neighbors=UMAP_NEIGHBORS, min_dist=UMAP_MIN_DIST, random_state=0).fit_transform(
+        StandardScaler().fit_transform(num))
+    hue_vals = df.loc[num.index, hue] if hue else None
+    sns.scatterplot(x=emb[:, 0], y=emb[:, 1], hue=hue_vals, s=14, alpha=0.6, ax=ax)
+    ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2")
+
+
+def render(df, kind, x=None, y=None, hue=None, fmt="png", dpi=None):
     """Render one chart -> (bytes, media_type). Validates inputs -- every column must
     fit the chart (FITS) -- and samples big/point charts. fmt = png | svg (SVG is
     vector, for print/publication)."""
@@ -234,7 +262,7 @@ def render(df, kind, x=None, y=None, hue=None, fmt="png"):
             ax.set_title(_title(kind, x, y, hue) + sample)
             _fit_xlabels(fig, ax)
             buf = io.BytesIO()
-            fig.savefig(buf, format=fmt, dpi=90, bbox_inches="tight")
+            fig.savefig(buf, format=fmt, dpi=dpi or SCREEN_DPI, bbox_inches="tight")
             return buf.getvalue(), _MEDIA[fmt]
         finally:
             plt.close(fig)   # always close, even if seaborn raised
@@ -264,7 +292,15 @@ if __name__ == "__main__":
     assert not any("vid" in cols for cols in opts["x"].values())   # a text ID is never offered
 
     # every chart the builder offers renders, png and svg
+    from importlib.util import find_spec
     for k in KINDS:
+        if k == "umap" and not find_spec("umap"):   # optional package: says how to install it
+            try:
+                render(d, k)
+                raise AssertionError("umap rendered without umap-learn")
+            except ValueError as exc:
+                assert "pip install umap-learn" in str(exc), exc
+            continue
         cols = opts["x"][k] or [None]
         img, media = render(d, k, x=cols[0], y=("num" if k in _NEEDS_Y else None), hue=("g" if k not in _NO_HUE else None))
         assert img[:4] == b"\x89PNG" and media == "image/png", k

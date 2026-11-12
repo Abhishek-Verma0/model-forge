@@ -143,6 +143,10 @@ def _supervised(doc, ds_id, run_id, res, settings):
                      f"{json.dumps(best.get('params', {}), default=str)}", 8.5, indent=0.15)
 
     doc.heading("6. Evaluation")
+    if primary == "accuracy" and (res.get("facts") or {}).get("imbalanced"):
+        doc.para("Caution: the classes are imbalanced and models were ranked by accuracy, which can stay high while "
+                 "the smaller class is never predicted. Read F1, recall, MCC, balanced accuracy and PR-AUC below "
+                 "before choosing a model.", 8.5, color="#b45309")
     metric_keys = [m for m in METRICS if any(m in (r.get("test") or {}) for r in res["models"].values())]
     shown = [primary] + [m for m in metric_keys if m != primary][:6]
     rows = []
@@ -271,7 +275,14 @@ def _explain(doc, ds_id, run_id, res):
                          "Mean |SHAP value|", s["units"], color=3), 2.6, left=1.9)
     elif ex.get("shap_note"):
         doc.para(ex["shap_note"], 8.5)
-    doc.para("These explanations support interpretation; they do not prove causation (plan §12).", 8, color="#555555")
+    pdp = [c for c in (ex.get("pdp") or {}).get("columns", []) if not c.get("error")]
+    if pdp:
+        doc.para(f"Partial dependence: the average prediction ({ex['pdp']['units']}) over {ex['pdp']['rows']} test "
+                 "rows when one column is set to each value of a grid, the other columns unchanged.")
+        for c in pdp:
+            doc.chart(C.lines(c["x"], [(cv["label"], cv["y"], None) for cv in c["curves"]],
+                              f"Partial dependence - {c['column']}", c["column"], ex["pdp"]["units"]), 2.2)
+    doc.para("These explanations support interpretation; they do not prove causation.", 8, color="#555555")
 
 
 def pdf(ds_id, run_id=None):
@@ -289,7 +300,7 @@ def pdf(ds_id, run_id=None):
     types = {c["column"]: c["detected_type"] for c in quality["checks"]["column_types"]["columns"]}
     doc.heading("1. Dataset description")
     doc.para(f"{df.shape[0]:,} rows and {df.shape[1]} columns; {profile['duplicate_rows']:,} duplicate row(s).")
-    doc.para(f"Ethics approval / consent (plan §24, entered by the researcher): {m.get('ethics') or 'not recorded'}.", 8)
+    doc.para(f"Ethics approval / consent (entered by the researcher):{m.get('ethics') or 'not recorded'}.", 8)
     personal = quality["checks"]["personal_data"]["columns"]
     if personal:
         doc.para("Possible personal data: " + ", ".join(f"{p['column']} ({p['kind']})" for p in personal)

@@ -403,9 +403,17 @@ def _describe(key, row):
 
 @lru_cache
 def table(task):
+    from training import presets
     rows = _classifiers() if task == "classification" else _regressors()
     rows.update(_optional(task))
-    return {key: _describe(key, row) for key, row in rows.items()}
+    rows = {key: _describe(key, row) for key, row in rows.items()}
+    try:                                    # plan §9.4 deep learning: only where PyTorch is installed
+        from training import deep
+        rows.update(deep.rows(task))
+    except (ImportError, OSError):          # OSError: a broken PyTorch install on Windows (a DLL fails to load)
+        pass
+    rows.update(presets.rows(task, rows))   # plan §9.6 tested pipelines: base model + one fixed step
+    return rows
 
 
 def incompatible(row, facts):
@@ -417,6 +425,12 @@ def incompatible(row, facts):
         return "needs non-negative inputs - preprocessing produced negative values"
     if facts["nan"] and not row["nan"]:
         return "can't handle missing values - add an impute step on the Preprocessing tab"
+    most = row.get("max_features")
+    if most and facts.get("features", 0) > most:
+        return f"takes at most {most:,} input features - this data has {facts['features']:,} after preprocessing"
+    need = row.get("needs_numeric") or 0
+    if facts.get("numeric_features", need) < need:
+        return f"its step needs at least {need} numeric features - this data has {facts['numeric_features']}"
     return None
 
 
@@ -492,7 +506,11 @@ if __name__ == "__main__":
     import subprocess
     import sys
     rows = table("classification")
-    assert {k for k, r in rows.items() if r["device"] == "gpu"} <= {"xgboost", "catboost"}, rows
+    assert {r.get("base", k) for k, r in rows.items() if r["device"] == "gpu" and r["family"] != "Deep learning"} \
+        <= {"xgboost", "catboost"}, rows
+    if "lstm" in rows:   # PyTorch models: on the GPU whenever torch sees one
+        import torch
+        assert (rows["lstm"]["device"] == "gpu") == torch.cuda.is_available()
     assert (rows["xgboost"]["make"](0).get_params().get("device") == "cuda") == (rows["xgboost"]["device"] == "gpu")
     assert (rows["catboost"]["make"](0).get_params().get("task_type") == "GPU") == (rows["catboost"]["device"] == "gpu")
     hidden = subprocess.run(

@@ -3,7 +3,9 @@
 fit_model(row, model, X, y, X_val, y_val, fit, on_epoch, check, classes)
   X, X_val    already preprocessed (fold rows / held-back rows); X_val may be None
   fit         {"early_stopping": bool, "patience": int} (empty for one-call models)
-  on_epoch    on_epoch(epoch, total, train_loss, val_loss, metric_name)
+  on_epoch    on_epoch(epoch, total, train_loss, val_loss, metric_name); a logger that also
+              wants accuracy per epoch (plan §11.1, neural networks) has a method
+              on_epoch.extra(epoch, train_accuracy, val_accuracy) -- classification only
   check       raises jobs.Stopped on cancel / time limit; polled every epoch
 returns (fitted model, info) -- info: epochs_trained, best_epoch, total, metric
 
@@ -17,6 +19,17 @@ import copy
 
 import numpy as np
 from sklearn.metrics import log_loss
+
+ACC_ROWS = 2000   # our starting point: training rows scored for the per-epoch training accuracy (a fixed sample)
+
+
+def _acc_rows(X, y, seed=0):
+    """A fixed sample of the training rows for the per-epoch training accuracy: scoring
+    every row each epoch would add a full extra pass per epoch."""
+    if X.shape[0] <= ACC_ROWS:
+        return X, np.asarray(y)
+    idx = np.sort(np.random.default_rng(seed).choice(X.shape[0], ACC_ROWS, replace=False))
+    return X[idx], np.asarray(y)[idx]
 
 
 class _Stop:
@@ -65,19 +78,26 @@ def _mlp(model, X, y, X_val, y_val, fit, on_epoch, check, classes):
     metric = "log loss" if clf else "half squared error"
     tol, patience = model.tol, int(fit.get("patience") or 0)
     best, best_loss, best_epoch, wait, epoch = None, np.inf, None, 0, 0
+    extra = getattr(on_epoch, "extra", None) if clf else None
+    if extra:
+        Xa, ya = _acc_rows(X, y)
     for epoch in range(1, total + 1):
         check()
         if clf:
             model.partial_fit(X, y, classes=classes)
         else:
             model.partial_fit(X, y)
-        val = None
+        val = val_acc = None
         if X_val is not None:
             if clf:
-                val = float(log_loss(y_val, model.predict_proba(X_val), labels=classes))
+                p = model.predict_proba(X_val)
+                val = float(log_loss(y_val, p, labels=classes))
+                val_acc = float(np.mean(model.classes_[p.argmax(axis=1)] == np.asarray(y_val)))
             else:
                 val = float(0.5 * np.mean((np.asarray(y_val) - model.predict(X_val)) ** 2))
         on_epoch(epoch, total, float(model.loss_), val, metric)
+        if extra:
+            extra(epoch, float(np.mean(model.predict(Xa) == ya)), val_acc)
         if _early(fit, X_val):
             if val < best_loss - tol:     # MLP's own tol (published default 1e-4)
                 best, best_loss, best_epoch, wait = copy.deepcopy(model), val, epoch, 0
@@ -264,6 +284,16 @@ if __name__ == "__main__":
                 assert info["best_epoch"] is not None and info["best_epoch"] <= info["epochs_trained"], (task, key, info)
             model.predict(X[va])
             pickle.dumps(model)  # a fitted model must be savable
+            if key == "mlp" and task == "classification":   # accuracy per epoch, when the logger asks for it
+                accs = []
+
+                def logger(e, t, a, b, m):
+                    pass
+                logger.extra = lambda e, tr_acc, va_acc: accs.append((e, tr_acc, va_acc))
+                fit_model(row, row["make"](0).set_params(**kwargs), X[tr], y[tr], X[va], y[va], fit, logger,
+                          lambda: None, classes)
+                assert accs and all(0 <= a <= 1 and 0 <= b <= 1 for _e, a, b in accs), accs[:3]
+                assert accs[-1][2] > 0.7, accs[-1]           # the signal is learnable
             # 2. a cancel inside training stops it within a few epochs and surfaces as Stopped
             # HistGB and CatBoost on GPU have no per-round hook: checked before fitting only
             if key != "hist_gradient_boosting" and not (key == "catboost" and row["device"] == "gpu"):

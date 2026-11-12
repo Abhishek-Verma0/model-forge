@@ -701,6 +701,7 @@ function Report({ data, setData, tab, setTab, target, setTarget, taskChoice = "a
               ],
             ]}
           />
+          <DuplicatePreview id={data.id} />
         </Section>
       )}
 
@@ -854,7 +855,7 @@ function Report({ data, setData, tab, setTab, target, setTarget, taskChoice = "a
       <div hidden={tab !== "training"}>
         <Train key={`train:${rev}:${prepRev}`} data={data} target={task === "clustering" ? "" : target} active={tab === "training"}
                onResults={setTrainResults} onAsk={(text) => setChatAsk((a) => ({ text, n: (a?.n || 0) + 1 }))}
-               onTrained={() => mark("train")} />
+               onTrained={() => mark("train")} onShowTraining={() => setTab("training")} />
         {footer("training")}
       </div>
 
@@ -886,6 +887,38 @@ function Section({ title, children }) {
       <p className="sectitle">{title}</p>
       {children}
     </section>
+  );
+}
+
+// plan §8.4 "detect, preview and remove": the duplicated rows themselves, grouped, before the
+// Cleaning step removes them (each group's values once, with the rows it appears on)
+function DuplicatePreview({ id }) {
+  const [dups, setDups] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => { setDups(null); setErr(""); }, [id]);
+  async function show() {
+    setBusy(true); setErr("");
+    try { setDups(await call(`/api/duplicates?id=${id}`)); } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+  if (!dups) return (
+    <div style={{ marginTop: 8 }}>
+      <button type="button" className="ghost" onClick={show} disabled={busy}>{busy ? "Loading…" : "Preview the duplicate rows"}</button>
+      {err && <div className="error">{err}</div>}
+    </div>
+  );
+  const cell = (v) => (v === null || v === undefined || v === "" ? <i className="note">blank</i> : String(v));
+  return (
+    <div style={{ marginTop: 8 }}>
+      <p className="note">
+        {dups.groups.length < dups.total_groups ? `First ${dups.groups.length} of ${num(dups.total_groups)}` : `All ${num(dups.total_groups)}`} group(s)
+        of identical rows. Row numbers count data rows of the current table from 1. Removing duplicates keeps the first row of each group.
+      </p>
+      <Table head={["Rows", "Copies", ...dups.columns]}
+             rows={dups.groups.map((g) => [g.rows.slice(0, 8).join(", ") + (g.rows.length > 8 ? ", …" : ""), g.copies,
+                                           ...dups.columns.map((c) => cell(g.values[c]))])} />
+    </div>
   );
 }
 

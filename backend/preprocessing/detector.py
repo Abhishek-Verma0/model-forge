@@ -129,6 +129,32 @@ def detect_duplicates(df, subset=None):
     }
 
 
+DUP_PREVIEW_GROUPS = 20   # our starting point: duplicate groups listed in the preview (plan §8.4 "preview")
+
+
+def duplicate_groups(df, limit=DUP_PREVIEW_GROUPS):
+    """The duplicated rows themselves, grouped -- what "remove duplicates" would act
+    on: each group's values once, how many copies, and their 1-based row numbers in
+    the current table. Same rule as detect_duplicates (every column equal, blanks
+    equal to blanks)."""
+    import json
+
+    import numpy as np
+    pos = np.flatnonzero(df.duplicated(keep=False).to_numpy())
+    columns = [str(c) for c in df.columns]
+    if not len(pos):
+        return {"columns": columns, "total_groups": 0, "groups": []}
+    # rows with equal values hash equally; groups keep the order they first appear in
+    keys = pd.util.hash_pandas_object(df.iloc[pos], index=False).to_numpy()
+    groups = list(pd.Series(pos).groupby(keys, sort=False).agg(list))
+    groups.sort(key=lambda g: g[0])
+    shown = groups[:limit]
+    values = json.loads(df.iloc[[g[0] for g in shown]].to_json(orient="records", date_format="iso"))
+    return {"columns": columns, "total_groups": len(groups),
+            "groups": [{"rows": [int(p) + 1 for p in g], "copies": len(g), "values": v}
+                       for g, v in zip(shown, values)]}
+
+
 def detect_outliers(df, iqr_multiplier=None):
     """
     Detect outliers in numeric columns using the IQR method.
@@ -746,6 +772,13 @@ if __name__ == "__main__":
     assert ds["deductions"], "a bad dataset must say WHY it lost points"
     # the score is only ever the deductions subtracted from 100
     assert abs(100 - sum(d["points"] for d in ds["deductions"]) - ds["score"]) < 0.2
+    # duplicate preview: groups in order of first appearance, blanks equal blanks, 1-based rows
+    dd = pd.DataFrame({"a": [1, 2, 1, 3, 2, None, None, 1], "b": ["x", "y", "x", "z", "y", None, None, "x"]})
+    g = duplicate_groups(dd)
+    assert g["total_groups"] == 3 and [x["rows"] for x in g["groups"]] == [[1, 3, 8], [2, 5], [6, 7]], g
+    assert g["groups"][0]["values"] == {"a": 1.0, "b": "x"} and g["groups"][2]["values"] == {"a": None, "b": None}
+    assert sum(x["copies"] - 1 for x in g["groups"]) == detect_duplicates(dd)["summary"]["duplicate_rows"]
+    assert duplicate_groups(dd, limit=1)["groups"][0]["copies"] == 3 and duplicate_groups(clean)["total_groups"] == 0
     # free text is kept (not an ID); many-valued short labels are "string"
     t = pd.DataFrame({"review": [f"great product number {i} works well" for i in range(60)],
                       "cpu": [f"Intel Core i{3 + i % 3} {i % 5}U" for i in range(60)],  # 15 labels

@@ -38,12 +38,18 @@ SEARCH = {
     "learning_rate": (0.01, 0.3, True), "n_neighbors": (1, 50, False), "num_leaves": (8, 128, False),
     "depth": (3, 10, False), "iterations": (100, 1000, False), "var_smoothing": (1e-12, 1e-6, True),
     "learning_rate_init": (1e-4, 1e-1, True),
+    # deep-learning models (training/deep.py)
+    "hidden": (16, 256, True), "layers": (1, 4, False), "dropout": (0.0, 0.5, False),
 }
 SEARCH_BY_MODEL = {
     ("multinomial_nb", "alpha"): (0.01, 10.0, True), ("complement_nb", "alpha"): (0.01, 10.0, True),
     ("mlp", "alpha"): (1e-6, 1e-1, True), ("xgboost", "max_depth"): (2, 12, False),
     ("gradient_boosting", "max_depth"): (2, 8, False), ("hist_gradient_boosting", "max_iter"): (50, 500, False),
     ("adaboost", "learning_rate"): (0.01, 2.0, True),
+    # Adam step sizes: the boosters' 0.01-0.3 is too large for these networks
+    ("lstm", "learning_rate"): (1e-4, 1e-2, True), ("gru", "learning_rate"): (1e-4, 1e-2, True),
+    ("cnn1d", "learning_rate"): (1e-4, 1e-2, True), ("tab_transformer", "learning_rate"): (1e-5, 1e-3, True),
+    ("tabnet", "learning_rate"): (1e-3, 5e-2, True), ("tabnet", "hidden"): (8, 64, True),
     # convergence / training-length settings, not model choices
     ("logistic_regression", "max_iter"): None, ("lasso", "max_iter"): None, ("elastic_net", "max_iter"): None,
 }
@@ -52,6 +58,7 @@ SEARCH_BY_MODEL = {
 def space(key, row):
     """{param: {kind, low, high, log, choices, none}} -- what a search varies by default."""
     out = {}
+    key = row.get("base", key)     # a tested pipeline searches its model's ranges (fs_xgboost -> xgboost)
     for p in row["params"]:
         if p["fit"] or p["kind"] in ("bool", "layers"):
             continue

@@ -83,7 +83,7 @@ export default function ReportPanel({ data, refreshKey, onDownloaded, onEthics }
       </div>
 
       <div className="panel ethics-panel">
-        <label htmlFor="ethics-note"><b>Ethics approval and consent</b> (plan §24, optional)</label>
+        <label htmlFor="ethics-note"><b>Ethics approval and consent</b> (optional)</label>
         <p className="note" style={{ marginTop: 2 }}>For data about people: the approving committee and reference number, and how
           consent was obtained. It is printed in the report&apos;s dataset description.</p>
         <textarea id="ethics-note" rows={3} maxLength={2000} value={ethics}

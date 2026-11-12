@@ -6,6 +6,7 @@ TestClient needs httpx2, which is not installed.
 Import this module FIRST in a test: it points DATA_DIR and the database at a fresh
 temporary folder before the app (and its config) load, so nothing real is touched."""
 
+import atexit
 import os
 import socket
 import tempfile
@@ -27,7 +28,15 @@ def serve(app):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    def stop():
+        # a daemon thread still logging while Python shuts down crashed the interpreter at exit
+        # ("could not acquire lock for <stderr> at interpreter shutdown"): stop it first
+        server.should_exit = True
+        thread.join(timeout=10)
+    atexit.register(stop)
     base = f"http://127.0.0.1:{port}"
     for _ in range(200):
         try:

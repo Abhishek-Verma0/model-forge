@@ -106,9 +106,12 @@ def fingerprint(ctx, folds):
 def facts(ctx):
     """Measured on the preprocessed training rows; decides compatibility and defaults."""
     t0 = time.time()
-    m = Prep(ctx["prep"]["columns"], ctx["prep"]["pipeline"], ctx["task"]).fit_transform(ctx["X_tr"], ctx["y_tr"])
+    prep = Prep(ctx["prep"]["columns"], ctx["prep"]["pipeline"], ctx["task"])
+    m = prep.fit_transform(ctx["X_tr"], ctx["y_tr"])
     values = m.data if issparse(m) else np.asarray(m)
+    text_width = sum(len(v.vocabulary_) for vecs in prep.fitted_["text"].values() for v in vecs)
     f = {"rows": int(m.shape[0]), "features": int(m.shape[1]), "sparse": bool(issparse(m)),
+         "numeric_features": int(m.shape[1]) - text_width,   # inputs that are not text TF-IDF terms
          "nan": bool(np.isnan(values).any()), "negative": bool((values < 0).any()),
          "prep_seconds": round(time.time() - t0, 3)}
     if ctx["task"] == "classification":
@@ -238,6 +241,10 @@ class _EpochLog:
         self.fit, self.progress = name, progress
         self.data["fits"][name] = []
 
+    def extra(self, epoch, train_acc, val_acc):
+        """Accuracy per epoch (classification networks, plan §11.1), drawn beside the loss."""
+        self.data.setdefault("accuracy", {}).setdefault(self.fit, []).append([epoch, train_acc, val_acc])
+
     def __call__(self, epoch, total, train, val, metric):
         self.data["fits"][self.fit].append([epoch, train, val])
         self.data["metric"], self.data["total"] = metric, total
@@ -295,6 +302,8 @@ def run(job, ds_id, settings):
         row = rows[key]
         rec = {"label": row["label"], "family": row["family"], "baseline": key == "baseline",
                "device": row["device"]}
+        if row.get("pipeline"):     # a tested pipeline: the step it adds, recorded with its result
+            rec["pipeline_step"] = row["pipeline"]
         fits_before = done
         try:
             kwargs, fit, record = P.resolve(row, settings.get("params", {}).get(key))

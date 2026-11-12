@@ -100,7 +100,7 @@ def pdf(ds_id):
     doc.bullets(["Findings depend on the coverage of the exporting database and the completeness of its metadata.",
                  "Counts and indices are within this collection only (not an author's whole career).",
                  "Countries and institutions are read from affiliation text and may miss unusual formats.",
-                 "Direct subscription-database access needs separate authorisation and licences (plan §31)."])
+                 "Direct subscription-database access needs separate authorisation and licences."])
     return doc.bytes()
 
 

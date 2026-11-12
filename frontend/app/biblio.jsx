@@ -185,9 +185,10 @@ function Upload({ onOpened }) {
         <li><b>Scopus</b>: Export → CSV (include citation information, abstracts &amp; keywords, references)</li>
         <li><b>Web of Science</b>: Export → Plain text file or Tab delimited file (Full record and cited references)</li>
         <li><b>PubMed</b>: Save → Format: PubMed (no citation counts)</li>
+        <li><b>Crossref / OpenAlex</b>: the JSON a <code>/works</code> API request returns (a list or one work)</li>
         <li><b>Dimensions / OpenAlex / Lens</b> CSV exports, matched by column name (title, year, source, authors, citations …)</li>
       </ul>
-      <input type="file" accept=".csv,.txt,.tsv,.nbib" onChange={(e) => setFile(e.target.files?.[0] || null)} />{" "}
+      <input type="file" accept=".csv,.txt,.tsv,.nbib,.json" onChange={(e) => setFile(e.target.files?.[0] || null)} />{" "}
       <button className="primary" disabled={!file || busy} onClick={send}>{busy ? "Reading…" : "Analyse"}</button>
       {err && <div className="error" style={{ marginTop: 8 }}>{err}</div>}
     </div>

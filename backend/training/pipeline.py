@@ -69,7 +69,9 @@ def build_pipeline(ctx, key, row, facts, folds, kwargs=None):
     """One model's fold-safe pipeline. The baseline gets the same row filters and
     preprocessing but no resampling or class weights (they would change what
     'most frequent class' means)."""
-    columns, pipeline, seed = ctx["prep"]["columns"], ctx["prep"]["pipeline"] or {}, ctx["seed"]
+    columns, seed = ctx["prep"]["columns"], ctx["seed"]
+    # a tested pipeline (training/presets.py) sets one section of the dataset-level steps for its row
+    pipeline = {**(ctx["prep"]["pipeline"] or {}), **(row.get("pipeline") or {})}
     steps = []
     cols_k = [(c, float(o.get("k", execute.IQR_K))) for c, ops in columns.items() for o in ops
               if o["op"] == "outliers" and o.get("method") == "remove_rows" and c in ctx["X_tr"].columns]

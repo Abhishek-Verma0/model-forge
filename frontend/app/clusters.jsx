@@ -10,6 +10,7 @@ import ParamsForm from "./params";
 
 const ACTIVE = ["queued", "running"];
 const POLL_MS = 1500;
+const POLL_RETRIES = 3; // our starting point: failed status reads in a row before giving up
 
 function SilhouettePlot({ data, title }) {
   const width = 560, left = 46, rowGap = 6, unit = 0.6;
@@ -74,7 +75,7 @@ export default function Clusters({ data, opt, onReload, onTrained }) {
   const loadHistory = () => call(`/api/runs/summary?id=${data.id}`).then((r) => setHistory(r.filter((x) => x.task === "clustering"))).catch(() => {});
   useEffect(() => { loadHistory(); }, [data.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  function poll(id) {
+  function poll(id, misses = 0) {
     timer.current = setTimeout(async () => {
       try {
         const [s, r] = await Promise.all([call(`/api/run?id=${data.id}&run=${id}`), call(`/api/run/results?id=${data.id}&run=${id}`)]);
@@ -82,7 +83,7 @@ export default function Clusters({ data, opt, onReload, onTrained }) {
         if (r.models) { setRes(r); if (!view && r.best) setView(r.best); }
         if (ACTIVE.includes(s.state)) poll(id);
         else { loadHistory(); if (s.state === "done") onTrained?.(); }
-      } catch (e) { setErr(e.message); }
+      } catch (e) { if (misses < POLL_RETRIES) poll(id, misses + 1); else setErr(e.message); }
     }, POLL_MS);
   }
 

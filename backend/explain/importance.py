@@ -8,12 +8,17 @@ on the run's locked test rows. Three views, each labelled for what it is:
   native       -- the model's own global importance (tree impurity importance, or
                   |coefficient| for linear models), summed per input column.
   shap         -- SHAP values: each column's contribution to each prediction, in the
-                  model's raw output (log-odds for classification, target units for
-                  regression). Exact for XGBoost / LightGBM / CatBoost (their built-in
-                  TreeSHAP; additivity verified on the installed versions) and for
-                  linear models (phi_j = w_j * (x_j - mean_j), background = training
-                  rows). Other model types need the `shap` package, which is not
-                  installed -- they get permutation importance only, and say so.
+                  model's raw output (log-odds for boosted classifiers, probability for
+                  tree / forest classifiers, target units for regression). Exact for
+                  XGBoost / LightGBM / CatBoost (their built-in TreeSHAP; additivity
+                  verified on the installed versions), for scikit-learn's tree models
+                  (explain/treeshap.py, checked against brute-force Shapley values) and
+                  for linear models (phi_j = w_j * (x_j - mean_j), background = training
+                  rows). Other model types (SVM, k-NN, naive Bayes, MLP, AdaBoost,
+                  ensembles) need the `shap` package, which is not installed -- they get
+                  permutation importance, partial dependence and LIME (explain/local.py).
+  partial      -- partial dependence (scikit-learn): the average prediction as one number
+  dependence      column is set to each value of a grid, the other columns as they are.
 
 Contributions of the features one input column turns into (one-hot categories,
 TF-IDF terms) are summed into that column: SHAP values are additive, so a group's
@@ -29,8 +34,9 @@ from scipy.sparse import csr_matrix, issparse
 from sklearn.inspection import permutation_importance
 
 from core import store
+from explain import treeshap
 from preprocessing.profiler import is_numeric
-from training import train
+from training import models, train
 from training.metrics import METRICS, scorers
 from training.pipeline import transform_steps
 
@@ -42,6 +48,13 @@ DOT_ROWS = 300           # our starting point: rows per column in the dot plot
 LINEAR = ("logistic_regression", "linear_regression", "ridge", "lasso", "elastic_net")
 TREE_SHAP = ("xgboost", "lightgbm", "catboost")
 PCA_GROUP = "reduced components (all numeric columns)"
+SKTREE_ROWS = 300        # our starting point: rows explained by the scikit-learn TreeSHAP (computed in numpy)
+SKTREE_MIN_ROWS = 50     # our starting point: ...never fewer, even on a huge forest
+SKTREE_BUDGET_S = 60     # our starting point: seconds before the scikit-learn TreeSHAP explains fewer rows
+PDP_COLUMNS = 4          # our starting point: number columns (most important first) given a partial dependence
+PDP_GRID = 20            # our starting point: grid points per column (scikit-learn's default is 100)
+PDP_ROWS = 500           # our starting point: rows averaged per grid point
+PDP_PERCENTILES = (0.05, 0.95)   # published default: scikit-learn partial_dependence percentiles
 
 
 def feature_groups(prep):
@@ -157,6 +170,84 @@ def _shap(key, model, X, Xtr_mean, groups, check):
     return names, np.concatenate(parts, axis=0)
 
 
+def shap_kind(key, task, model):
+    """('booster' | 'linear' | 'sktree' | None, base model key) for a run model (tested
+    pipelines use their base model)."""
+    base = models.table(task).get(key, {}).get("base", key)
+    if base in TREE_SHAP:
+        return "booster", base
+    if base in LINEAR:
+        return "linear", base
+    if treeshap.supports(model):
+        return "sktree", base
+    return None, base
+
+
+SHAP_METHOD = {"booster": "TreeSHAP (built into the library)",
+               "sktree": "TreeSHAP (exact, path-dependent; computed here for scikit-learn trees)",
+               "linear": "exact linear SHAP (features independent, background = training rows)"}
+
+
+def shap_rows(kind, base, pipe, X, ctx, check=lambda: None, budget_s=None):
+    """Grouped SHAP for the rows X (raw input columns): (names, rows x classes x
+    columns, rows kept, units). Rows kept < len(X) only for a huge scikit-learn forest
+    under budget_s (the first rows are kept)."""
+    steps, model = list(pipe.steps[:-1]), pipe.steps[-1][1]
+    groups = feature_groups(pipe.named_steps["prep"])
+    Xt = transform_steps(steps, X)
+    if kind == "sktree":
+        phi_u, used, _ = treeshap.shap_values(model, Xt, check, budget_s, SKTREE_MIN_ROWS)
+        names, G = _indicator(groups)
+        if used:
+            Gu = G[used]
+            phi = np.stack([np.asarray(Gu.T @ phi_u[:, k, :].T).T for k in range(phi_u.shape[1])], axis=1)
+        else:
+            phi = np.zeros((len(phi_u), phi_u.shape[1], len(names)))
+        return names, phi, len(phi), treeshap.ensemble(model)[3]
+    Xtr_mean = None
+    if kind == "linear":
+        Xtr_mean = np.asarray(transform_steps(steps, ctx["X_tr"]).mean(axis=0)).ravel()
+    names, phi = _shap(base, model, Xt, Xtr_mean, groups, check)
+    return names, phi, len(phi), "log-odds" if ctx["task"] == "classification" else "target units"
+
+
+def partial(pipe, X, columns, task, classes, pos, seed):
+    """Partial dependence of the prediction on each column (scikit-learn
+    partial_dependence, brute force through the whole pipeline)."""
+    from sklearn.inspection import partial_dependence
+    rows = X if len(X) <= PDP_ROWS else X.sample(PDP_ROWS, random_state=seed)
+    clf = task == "classification"
+    proba = clf and hasattr(pipe, "predict_proba")
+    if clf and not proba and len(classes) != 2:
+        return [{"column": c, "error": "this model gives no probabilities and more than two classes"} for c in columns]
+    # asked for explicitly: "auto" falls back to decision_function, whose scores are not probabilities
+    method = "predict_proba" if proba else "decision_function" if clf else "auto"
+    units = "probability" if proba else "decision score" if clf else "target units"
+    out = []
+    for col in columns:
+        Xp = rows.copy()
+        Xp[col] = Xp[col].astype(float)     # grid points need not be whole numbers
+        try:
+            r = partial_dependence(pipe, Xp, [col], grid_resolution=PDP_GRID, kind="average",
+                                   percentiles=PDP_PERCENTILES, response_method=method)
+        except (ValueError, TypeError, AttributeError) as exc:
+            out.append({"column": col, "error": str(exc)})
+            continue
+        avg = np.asarray(r["average"], float)
+        if clf and len(classes) == 2:         # one output, for class index 1: flip to the positive class
+            name = classes[1 if pos is None else pos]
+            flipped = (1 - avg[0]) if proba else -avg[0]
+            curves = [{"label": f"P({name})" if proba else f"score for {name}",
+                       "y": (flipped if pos == 0 else avg[0]).tolist()}]
+        elif clf:
+            curves = [{"label": f"P({c})", "y": avg[i].tolist()} for i, c in enumerate(classes) if i < len(avg)]
+        else:
+            curves = [{"label": "prediction", "y": avg[0].tolist()}]
+        out.append({"column": col, "units": units, "x": np.asarray(r["grid_values"][0], float).tolist(),
+                    "curves": curves})
+    return out
+
+
 def explain(job, ds_id, run_id, key):
     """Background job (core/jobs): writes runs/<run_id>/explain/<key>.json."""
     res = store.read_json(store.run_dir(ds_id, run_id) / "results.json") or {}
@@ -190,25 +281,25 @@ def explain(job, ds_id, run_id, key):
     # 2. + 3. model-native importance and SHAP, on the model's own input features
     job.check()
     job.progress(step="model importance and SHAP")
-    steps = list(pipe.steps[:-1])
     model = pipe.steps[-1][1]
     groups = feature_groups(pipe.named_steps["prep"])
     kind, shares = _native(model, groups)
     out["native"] = {"kind": kind, "columns": [{"column": g, "share": v} for g, v in shares.items()]} if kind else None
-    if key in TREE_SHAP or key in LINEAR:
-        Xt = transform_steps(steps, X)
-        Xtr_mean = None
-        if key in LINEAR:
-            Xtr = transform_steps(steps, ctx["X_tr"])
-            Xtr_mean = np.asarray(Xtr.mean(axis=0)).ravel()
-        names, phi = _shap(key, model, Xt, Xtr_mean, groups, job.check)   # rows x classes x columns
+    kind_shap, base = shap_kind(key, task, model)
+    if kind_shap:
+        Xs = X
+        if kind_shap == "sktree" and len(X) > SKTREE_ROWS:     # computed in numpy: fewer rows
+            Xs = X.iloc[np.sort(np.random.default_rng(seed).permutation(len(X))[:SKTREE_ROWS])]
+        names, phi, kept, units = shap_rows(kind_shap, base, pipe, Xs, ctx, job.check,
+                                            SKTREE_BUDGET_S if kind_shap == "sktree" else None)
+        Xs = Xs.iloc[:kept]
         classes = ctx["classes"]
         if phi.shape[1] == 1 and task == "classification" and pos == 0:
-            phi = -phi            # one output = log-odds of class index 1; flip to the positive class
+            phi = -phi            # one output = class index 1; flip to the positive class
         bar = np.abs(phi).mean(axis=(0, 1))     # mean |SHAP| (averaged over classes for multiclass)
         top = list(np.argsort(-bar))
         if phi.shape[1] > 1:   # multiclass: each row explained for the class the model predicted
-            pred = np.asarray(pipe.predict(X)).astype(int)
+            pred = np.asarray(pipe.predict(Xs)).astype(int)
             row_phi = phi[np.arange(len(phi)), pred, :]
             explained = "the class each row was predicted as"
         else:
@@ -219,20 +310,28 @@ def explain(job, ds_id, run_id, key):
         pick = np.random.default_rng(seed).permutation(len(row_phi))[:DOT_ROWS]
         for j in top[:TOP_DOTS]:
             col = names[j]
-            vals = X[col].iloc[pick] if col in X.columns and is_numeric(X[col]) else None
+            vals = Xs[col].iloc[pick] if col in Xs.columns and is_numeric(Xs[col]) else None
             if vals is not None:   # colour = the row's value, as a rank 0..1 (high = red, like the shap library)
                 vals = vals.rank(pct=True).fillna(-1).round(3).tolist()
             dots.append({"column": col, "shap": np.round(row_phi[pick, j], 5).tolist(), "value_rank": vals})
-        out["shap"] = {"method": "TreeSHAP (built into the library)" if key in TREE_SHAP else
-                       "exact linear SHAP (features independent, background = training rows)",
-                       "units": "log-odds" if task == "classification" else "target units",
-                       "explained": explained,
+        out["shap"] = {"method": SHAP_METHOD[kind_shap], "units": units, "explained": explained,
+                       "rows": int(len(Xs)),
                        "columns": [{"column": names[j], "mean_abs": float(bar[j])} for j in top],
                        "dots": dots}
     else:
         out["shap"] = None
         out["shap_note"] = ("SHAP for this model type needs the shap package (pip install shap), which is not "
-                            "installed - permutation importance above works for every model.")
+                            "installed - permutation importance, partial dependence and the single-prediction "
+                            "explanation (LIME) work for every model.")
+
+    # 4. partial dependence for the most important number columns (by permutation importance)
+    job.check()
+    job.progress(step="partial dependence")
+    numeric = [c["column"] for c in out["permutation"]["columns"]
+               if c["column"] in X.columns and is_numeric(X[c["column"]]) and X[c["column"]].nunique() > 1]
+    cols = partial(pipe, X, numeric[:PDP_COLUMNS], task, ctx["classes"] or [], pos, seed)
+    out["pdp"] = {"rows": int(min(len(X), PDP_ROWS)), "grid": PDP_GRID, "percentiles": list(PDP_PERCENTILES),
+                  "units": next((c["units"] for c in cols if "units" in c), "target units"), "columns": cols}
     folder = store.run_dir(ds_id, run_id) / "explain"
     folder.mkdir(exist_ok=True)
     store.write_json(folder / f"{key}.json", out)
@@ -295,13 +394,13 @@ if __name__ == "__main__":
     for k, e in ex.items():
         perm = [c["column"] for c in e["permutation"]["columns"]]
         assert perm[0] == "signal" and set(perm) == {"signal", "noise", "color", "note"}, (k, perm)
+        assert e["pdp"]["columns"][0]["column"] == "signal" and len(e["pdp"]["columns"][0]["x"]) > 2, (k, e["pdp"])
         if k == "random_forest":
-            assert e["shap"] is None and "shap package" in e["shap_note"]
             # impurity importance summed over thousands of TF-IDF terms ranks the near-noise text
             # column first; permutation (above) ranks the real signal first -- why both are shown
             share = {c["column"]: c["share"] for c in e["native"]["columns"]}
             assert share["note"] > share["signal"] and "favours" in e["native"]["kind"], share
-            continue
+            assert e["shap"]["units"] == "probability" and "scikit-learn" in e["shap"]["method"], e["shap"]
         assert e["shap"]["columns"][0]["column"] == "signal", (k, e["shap"]["columns"][:3])
         assert {c["column"] for c in e["shap"]["columns"]} == {"signal", "noise", "color", "note"}, k
 
@@ -334,5 +433,17 @@ if __name__ == "__main__":
     _, exm = run_and_explain(dsm, ["catboost"], "accuracy")
     assert exm["catboost"]["shap"]["columns"][0]["column"] == "signal"
     assert exm["catboost"]["shap"]["explained"] == "the class each row was predicted as"
+    # a model with no SHAP here (k-NN) still gets permutation + partial dependence, and says why
+    _, exk = run_and_explain(dsr, ["knn"], "rmse")
+    assert exk["knn"]["shap"] is None and "shap package" in exk["knn"]["shap_note"] and exk["knn"]["pdp"]["columns"]
+    # a classifier without probabilities (SVM): PDP is a decision score and says so - never shown as a probability
+    _, exs = run_and_explain(ds, ["svm"], "accuracy")
+    sv = exs["svm"]["pdp"]
+    assert sv["units"] == "decision score" and sv["columns"][0]["curves"][0]["label"].startswith("score for"), sv
+    assert exk["knn"]["pdp"]["units"] == "target units" and ex["random_forest"]["pdp"]["units"] == "probability"
+    # PDP of the signal: P(yes) rises with it, P(no) falls (the curve is for the run's positive class)
+    pd_curve = ex["logistic_regression"]["pdp"]["columns"][0]["curves"][0]
+    rising = pd_curve["y"][-1] > pd_curve["y"][0]
+    assert rising == (pd_curve["label"] == "P(yes)") and pd_curve["label"] in ("P(yes)", "P(no)"), pd_curve
     assert cached(ds, run, "../../meta") is None and cached(ds, run, "xgboost") is not None
     print("explain self-check passed")

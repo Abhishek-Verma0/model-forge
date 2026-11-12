@@ -12,9 +12,9 @@ before encoding, on the numeric columns).
 pipeline = {
   "imputation":      {"method": "knn"|"iterative", "n_neighbors": 5},  # numeric block, train-fit
   "outlier_removal": {"method": "isolation_forest", "contamination": 0.05},  # drops TRAIN rows only
-  "feature_selection":{"method": "correlation"|"chi2"|"anova"|"mutual_info"|"rfe", "k": 10},
+  "feature_selection":{"method": "correlation"|"chi2"|"anova"|"mutual_info"|"rfe", "k": 10},  # k < 1: share kept
   "imbalance":       {"method": "oversample"|"undersample"|"smote"|"class_weights"},
-  "reduction":       {"method": "pca"|"autoencoder", "n": 5},
+  "reduction":       {"method": "pca"|"autoencoder", "n": 5, "scale": False},  # n < 1: variance kept
 }
 Any sub-key omitted / {"method":"none"} = that step is skipped.
 
@@ -22,6 +22,8 @@ ponytail: t-SNE/UMAP (spec's "reduction for visualization") are deferred -- they
 transductive (no train->test transform) and UMAP is a heavy extra dep; the EDA tab's
 scatter/pairplot already cover 2-D visualization.
 """
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -117,7 +119,8 @@ def select_features(X_tr, X_te, y_tr, method, k, task):
     )
     from functools import partial
     num = X_tr.select_dtypes("number")  # raw text columns pass through untouched
-    k = max(1, min(int(k or 10), num.shape[1]))
+    k = float(k or 10)
+    k = max(1, min(math.ceil(k * num.shape[1]) if 0 < k < 1 else int(k), num.shape[1]))  # k < 1: a share
     if num.shape[1] <= k:
         return X_tr, X_te, "fewer features than k -- nothing removed", None
     y = pd.factorize(y_tr)[0] if task == "classification" else pd.to_numeric(y_tr, errors="coerce")
@@ -195,8 +198,11 @@ def balance(X_tr, y_tr, method, task):
 
 # --- dimensionality reduction (fit on train) --------------------------------
 
-def fit_reduce(X_tr, n, method="pca"):
+def fit_reduce(X_tr, n, method="pca", scale=False):
     """Numeric columns -> n components, fitted on train. pca: principal components.
+    n below 1 is a share of variance: as many components as keep it (for the
+    autoencoder: as many units). scale=True standardises the columns first (fitted
+    here, replayed by reduce_apply) -- the tested hybrid pipelines use it.
     autoencoder (plan §9.6 "autoencoder + classifier"): a one-hidden-layer network
     (scikit-learn MLPRegressor, its default ReLU) trained to rebuild its input from
     n units; the n unit activations become the features. Scale the numeric columns
@@ -204,23 +210,34 @@ def fit_reduce(X_tr, n, method="pca"):
     num = X_tr.select_dtypes("number")
     if num.shape[1] < 2:
         return None, "too few numeric features for reduction"
+    scaler = None
+    if scale:
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler().fit(num)
+        num = pd.DataFrame(scaler.transform(num), columns=num.columns, index=num.index)
+    share = None
+    if n is not None and 0 < float(n) < 1:
+        share = float(n)
+        n = int(PCA(n_components=share, svd_solver="full").fit(num).n_components_)
     n = max(1, min(int(n or 2), num.shape[1]))
+    kept = f" (keeps {share:.0%} of the variance)" if share else ""
     if method == "autoencoder":
         import warnings
         from sklearn.neural_network import MLPRegressor
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")   # ConvergenceWarning at the default 200 epochs is reported below
             ae = MLPRegressor(hidden_layer_sizes=(n,), random_state=0).fit(num, num)
-        state = {"ae": ae, "num": list(num.columns), "n": n, "prefix": "ae"}
-        return state, (f"autoencoder -> {n} feature(s), rebuilds the training columns with "
+        state = {"ae": ae, "num": list(num.columns), "n": n, "prefix": "ae", "scaler": scaler}
+        return state, (f"autoencoder -> {n} feature(s){kept}, rebuilds the training columns with "
                        f"R² {ae.score(num, num):.2f}")
-    state = {"pca": PCA(n_components=n, random_state=0).fit(num), "num": list(num.columns), "n": n, "prefix": "pc"}
+    state = {"pca": PCA(n_components=n, random_state=0).fit(num), "num": list(num.columns), "n": n, "prefix": "pc",
+             "scaler": scaler}
     var = round(float(state["pca"].explained_variance_ratio_.sum()) * 100, 1)
-    return state, f"PCA -> {n} component(s), {var}% variance retained"
+    return state, f"PCA -> {n} component(s), {var}% variance retained" + (" (standardised first)" if scale else "")
 
 
-def reduce(X_tr, X_te, method, n):
-    state, note = fit_reduce(X_tr, n, method or "pca")
+def reduce(X_tr, X_te, method, n, scale=False):
+    state, note = fit_reduce(X_tr, n, method or "pca", scale)
     if state is None:
         return X_tr, X_te, note, None
     return reduce_apply(state, X_tr), reduce_apply(state, X_te), note, state
@@ -228,11 +245,14 @@ def reduce(X_tr, X_te, method, n):
 
 def reduce_apply(state, X):
     """Numeric columns -> components; anything else (raw text) passes through."""
-    num = X[state["num"]].to_numpy(dtype="float64")
+    cols = X[state["num"]]
+    if state.get("scaler") is not None:       # pipelines saved before "scale" existed have no scaler
+        cols = pd.DataFrame(state["scaler"].transform(cols), columns=cols.columns, index=cols.index)
+    num = cols.to_numpy(dtype="float64")
     if "ae" in state:   # encoder half: ReLU(X W + b) of the hidden layer
         Z = np.maximum(num @ state["ae"].coefs_[0] + state["ae"].intercepts_[0], 0)
     else:
-        Z = state["pca"].transform(X[state["num"]])
+        Z = state["pca"].transform(cols)
     prefix = state.get("prefix", "pc")      # pipelines saved before autoencoders have no prefix
     pcs = pd.DataFrame(Z, columns=[f"{prefix}{i + 1}" for i in range(Z.shape[1])], index=X.index)
     return pd.concat([pcs, X.drop(columns=state["num"])], axis=1)
@@ -280,6 +300,22 @@ if __name__ == "__main__":
     assert list(a_tr.columns) == ["ae1", "ae2"] and len(a_te) == 10 and "autoencoder" in note, note
     hidden = st["ae"].coefs_[0].shape[1]
     assert hidden == 2 and (a_tr.to_numpy() >= 0).all()      # ReLU activations of the 2 hidden units
+
+    # n < 1 = variance share; scale=True standardises first and is replayed on new rows
+    wide = pd.DataFrame(rng.normal(size=(150, 6)) * [1, 10, 100, 1, 1, 1], columns=list("uvwxyz"))
+    st, note = fit_reduce(wide, 0.95, "pca", scale=True)
+    from sklearn.pipeline import make_pipeline
+    ref = make_pipeline(StandardScaler(), PCA(n_components=0.95, svd_solver="full")).fit(wide)
+    assert st["n"] == ref[-1].n_components_ and "standardised" in note, (st["n"], note)
+    assert np.allclose(np.abs(reduce_apply(st, wide).to_numpy()), np.abs(ref.transform(wide)), atol=1e-6)
+    ae_st, note = fit_reduce(wide, 0.95, "autoencoder", scale=True)
+    assert ae_st["n"] == st["n"] and "95%" in note and reduce_apply(ae_st, wide.iloc[:3]).shape == (3, st["n"])
+    unscaled = fit_reduce(wide, 2, "pca")[0]                         # saved pipelines: no scaler, same as before
+    assert unscaled["scaler"] is None and np.allclose(reduce_apply(unscaled, wide).to_numpy(),
+                                                      PCA(n_components=2, random_state=0).fit(wide).transform(wide))
+    # feature selection k < 1 = share of the numeric features kept
+    yy = (wide["u"] > 0).astype(int)
+    assert select_features(wide, wide, yy, "mutual_info", 0.5, "classification")[0].shape[1] == 3
 
     validate_pipeline({"feature_selection": {"method": "chi2", "k": 3}})
     try:

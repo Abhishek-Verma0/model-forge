@@ -64,6 +64,10 @@ def _validate(op):
         raise ValueError(f"impute.strategy must be one of {sorted(_IMPUTE)}")
     if name == "encode" and op.get("method", "onehot") not in _ENCODE:
         raise ValueError(f"encode.method must be one of {sorted(_ENCODE)}")
+    order = op.get("order") if name == "encode" else None
+    if order is not None and (not isinstance(order, list) or not all(isinstance(v, str) for v in order)
+                              or len(set(order)) != len(order)):
+        raise ValueError("encode.order must be a list of distinct category names (lowest first).")
     if name == "scale" and op.get("method", "standard") not in _SCALERS:
         raise ValueError(f"scale.method must be one of {sorted(_SCALERS)}")
     if name == "outliers" and op.get("method", "clip_iqr") not in _OUTLIER:
@@ -179,7 +183,11 @@ def _encode(op, col, fr, st, intlike):
     s = fr[col].astype("string")
     if method == "ordinal":
         if st is None:
-            st = {v: i for i, v in enumerate(s.dropna().unique())}
+            # the user's order (lowest first, e.g. low < medium < high) when given; categories it
+            # doesn't name -- and every category without one -- follow in order of first appearance
+            st = {v: i for i, v in enumerate(op.get("order") or [])}
+            for v in s.dropna().unique():
+                st.setdefault(v, len(st))
         fr[col] = s.map(st).fillna(-1).astype("int64")  # unseen -> -1
         return fr, st
     # onehot: categories fixed on TRAIN; unseen categories -> all-zero row.
@@ -327,8 +335,9 @@ def fit_prep(X_tr, y_tr, columns, pipeline, task, intlike_cols):
             tr_out, tr_out.iloc[:0], y_tr, advanced._m("feature_selection", pipeline), k, task)
         notes.append(_n)
     if advanced._m("reduction", pipeline):
-        fitted["pca"], _n = advanced.fit_reduce(tr_out, (pipeline.get("reduction") or {}).get("n", PCA_N),
-                                                advanced._m("reduction", pipeline))
+        red = pipeline.get("reduction") or {}
+        fitted["pca"], _n = advanced.fit_reduce(tr_out, red.get("n", PCA_N), advanced._m("reduction", pipeline),
+                                                bool(red.get("scale")))
         if fitted["pca"]:
             tr_out = advanced.reduce_apply(fitted["pca"], tr_out)
         notes.append(_n)
@@ -501,6 +510,8 @@ def _label(name, op, ncols, st=None):
         if m == "text":
             terms = sum(len(v.vocabulary_) for v in st)
             return f"text kept; word+letter tf-idf fit on train ({terms:,} terms, applied at training)"
+        if m == "ordinal" and op.get("order"):
+            return "encode(ordinal: " + " < ".join(op["order"]) + ")"
         return f"encode({m})" + (f" -> {ncols} cols" if m == "onehot" else "")
     if name == "outliers":
         m = op.get("method", "clip_iqr")
@@ -548,6 +559,25 @@ if __name__ == "__main__":
     a = apply_plan(df, "label", plan, random_state=1)["preview"]
     assert a == apply_plan(df, "label", plan, random_state=1)["preview"], "seed must reproduce the split"
     assert not apply_plan(df, "label", plan, stratify=False)["stratified"]
+
+    # ordinal: the user's order (lowest first) sets the codes; unnamed categories follow it,
+    # and without an order the codes are first-appearance (what saved pipelines used)
+    lvl = pd.DataFrame({"size": ["mid", "low", "high", "mid", "low", "high", "huge", "mid", "low", "high"],
+                        "label": df["label"]})
+    st = _encode({"op": "encode", "method": "ordinal", "order": ["low", "mid", "high"]}, "size",
+                 lvl[["size"]].copy(), None, False)[1]
+    assert st == {"low": 0, "mid": 1, "high": 2, "huge": 3}, st
+    assert _encode({"op": "encode", "method": "ordinal"}, "size", lvl[["size"]].copy(), None, False)[1] == \
+        {"mid": 0, "low": 1, "high": 2, "huge": 3}
+    o = apply_plan(lvl, "label", {"size": [{"op": "encode", "method": "ordinal", "order": ["low", "mid", "high"]}]},
+                   test_size=0.2, random_state=0)
+    assert "encode(ordinal: low < mid < high)" in o["summary"][0]["ops"], o["summary"]
+    for bad in ("low", ["low", "low"], [1, 2]):
+        try:
+            _validate({"op": "encode", "method": "ordinal", "order": bad})
+            raise AssertionError(f"bad order accepted: {bad}")
+        except ValueError:
+            pass
     for bad in (0.9, 0.01):
         try:
             apply_plan(df, "label", plan, test_size=bad)
